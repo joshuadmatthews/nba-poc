@@ -52,7 +52,7 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * The Redis caches this service used to write in the relay (nba:rulefacts, nba:suppressed) are now DERIVED
  * by consuming the compacted nba.definitions topic (single source of truth), so they can never drift from
- * what the downstream consumers see. The old per-def mirror (nba:action:*) had no readers and was dropped.
+ * what the downstream consumers see.
  */
 public class ActionLibrary {
     private static final Logger log = LoggerFactory.getLogger(ActionLibrary.class);

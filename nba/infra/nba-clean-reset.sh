@@ -3,7 +3,7 @@
 # bronze, and restart the flywheel from a known-good foundation.
 #
 # PRESERVES (your investment): trained RL policy /Volumes/nba_ml/core/ckpt/rl_qnet.json, the action/journey
-# definitions (nba.definitions topic + Redis nba:action:*/nba:actions/nba:rulefacts + dim_definitions),
+# definitions (nba.definitions topic + Redis nba:rulefacts + dim_definitions),
 # the model cards (gold_model_card*), the action->fact map, and the kafka-connect config topics.
 #
 # WIPES: the ~42M junk in the data topics, the ~7.9M-row medallion data tables, the Redis loop working state.
@@ -76,7 +76,7 @@ phase_wipe(){
   echo "-- medallion (truncate data tables; defs + model cards kept) --"
   lake_auth
   for tb in $LAKE_TABLES; do sql "TRUNCATE TABLE workspace.nba_poc.$tb" >/dev/null; printf "   truncated %s\n" "$tb"; done
-  echo "-- redis loop state (keep nba:action:*/nba:actions/nba:rulefacts) --"
+  echo "-- redis loop state (keep nba:rulefacts) --"
   for p in "nba:snapshot:*" "nba:idmap:*" "nba:eval:*" "nba:disposition:*" "nba:activation:*" "nba:latch:*" "nba:lock:*"; do
     PX exec $REDIS sh -c "redis-cli --scan --pattern '$p' | xargs -r -n 500 redis-cli del" >/dev/null 2>&1
   done

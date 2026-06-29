@@ -27,12 +27,21 @@ produce(){ echo "$3" | podman exec -i ais-nba-redpanda rpk topic produce "$1" -k
 # Base sits below wall-clock so the datalake's real-time count facts win over test seeds.
 mkts(){ TSN=$((TSN+1)); TS=$((1719000000000+TSN)); }
 
-# ---- fixtures: resolve the seeded action ids by name ----
+# ---- fixtures: resolve an action id by name from nba.definitions (the single source of truth) ----
 action_id(){ # name -> actionId
-  local k
-  for k in $(R --scan --pattern 'nba:action:*'); do
-    R get "$k" | python -c "import json,sys;d=json.load(sys.stdin);print(d['id']) if d.get('name')=='$1' else None" 2>/dev/null
-  done | grep -v '^None$' | grep . | head -1
+  local hwm
+  hwm=$(podman exec ais-nba-redpanda rpk topic describe nba.definitions -p 2>/dev/null | awk '/^[0-9]/{print $6}')
+  { [ -z "$hwm" ] || [ "$hwm" -le 0 ]; } && return
+  podman exec ais-nba-redpanda rpk topic consume nba.definitions -o start -n "$hwm" -f '%k\t%v\n' 2>/dev/null \
+    | python -c "import json,sys
+name='$1'; out=''
+for line in sys.stdin:
+    k,_,v=line.partition('\t')
+    if not k.startswith('ACTION:'): continue
+    try: d=json.loads(v)
+    except Exception: continue
+    if d.get('name')==name: out=d.get('id') or k.split(':',1)[1]
+print(out)" | grep . | head -1
 }
 
 # ---- fact helpers ----
