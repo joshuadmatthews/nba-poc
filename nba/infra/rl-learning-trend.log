@@ -1,0 +1,8 @@
+# RL learning trend — n_real vs route_to_engaged across retrains (proving accumulation->learning)
+2026-06-26T20:10Z run=659388332694477 n_real=10961 route_to_engaged=0.25 cql=0.409 stars=0.102 promoted=true (stale sim)
+2026-06-26T20:10Z run=322893070553500 n_real=25508 route_to_engaged=0.25 cql=0.324 stars=0.000 promoted=true (fresh sim, 500 members)
+2026-06-26T20:15Z run=102324353072735 n_real=10961 route_to_engaged=0.25 cql=0.409 stars=0.102
+2026-06-26T21:05Z run=235070103424045 n_real=15052 route_to_engaged=0.25 cql=0.431 stars=0.075
+2026-06-26T23:06Z run=287090338352008 n_real=37078 route_to_engaged=0.5 cql=0.284 stars=0.000
+2026-06-27T00:06Z run=313604030074202 n_real=79516 route_to_engaged=0.25 cql=0.261 stars=0.000
+2026-06-27T01:07Z run=1109839052595602 n_real=101086 route_to_engaged=0.25 cql=0.258 stars=0.000

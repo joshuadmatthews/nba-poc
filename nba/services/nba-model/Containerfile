@@ -1,0 +1,13 @@
+# nba-model — local CQL Q-net serving (pure numpy + FastAPI). The action-library fast path calls /score here.
+FROM docker.io/library/python:3.11-slim
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app.py model.py ./
+# The Q-net artifact is BAKED for reproducibility; override at runtime with -v <healthcare rl_qnet.json>:/app/rl_qnet.json:ro
+# (model.py hot-reloads on mtime change). run.ps1 stages this from nba/databricks/ml/rl_qnet.json.
+COPY rl_qnet.json /app/rl_qnet.json
+ENV NBA_QNET_PATH=/app/rl_qnet.json
+EXPOSE 7011
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7011"]

@@ -1,0 +1,377 @@
+# NBA ML pipeline — Databricks Asset Bundle for the ML workspace.
+# All tasks run on SERVERLESS jobs compute (no cluster spec) — each spins up, runs minutes, stops. Deploy:
+#   databricks bundle deploy -t ml     Run:  databricks bundle run -t ml <job>
+# Reads the NBA lake (silver/gold) from src_catalog via Unity Catalog (same metastore).
+bundle:
+  name: nba-ml
+
+variables:
+  ml_catalog:
+    default: ml_worspace        # the ML workspace's catalog (name as created by the workspace)
+  ml_schema:
+    default: core
+  src_catalog:
+    default: workspace          # the NBA lake catalog (nba_poc lives here)
+  src_schema:
+    default: nba_poc
+  # Kafka config: if these stay "" (e.g. a deploy that doesn't supply BUNDLE_VAR_kafka_*), the streaming jobs FALL BACK
+  # to the 'nba-kafka' SECRET SCOPE (nba_ml_common.kafka_cfg) — the durable source of truth, so an empty deploy can no
+  # longer crash the scorer on an empty consumer config. Refresh the endpoint/creds in the secret scope, not here.
+  kafka_bootstrap:
+    default: ""
+  kafka_sasl_user:
+    default: ""
+  kafka_sasl_pass:
+    default: ""
+
+targets:
+  ml:
+    mode: production
+    default: true
+    workspace:
+      host: https://<your-databricks-workspace>.cloud.databricks.com
+  dev:
+    mode: development           # run in the lake's own (nba_poc) workspace instead, for a self-contained test
+    variables:
+      src_catalog: workspace
+
+resources:
+  jobs:
+
+    # EVERY job pins serverless ENVIRONMENT VERSION 4 — mlflow 2.22 + scikit-learn 1.6 live in that base, and every
+    # notebook %runs nba_ml_common (which `import mlflow.pyfunc` at module top). The leaner DEFAULT serverless env has
+    # NO mlflow, so unpinned jobs fail to even import — which silently broke the propensity pipeline (empty @champion).
+    # No extra dependencies => no pip/index install (this workspace's serverless has no working PyPI index).
+    nba_ml_bootstrap:
+      name: nba-ml-bootstrap
+      environments:
+        - environment_key: ml
+          spec: &mlenv { client: "4" }
+      tasks:
+        - task_key: simulate
+          environment_key: ml
+          notebook_task:
+            notebook_path: ./nba_ml_simulate.py
+            base_parameters: &params
+              ml_catalog: ${var.ml_catalog}
+              ml_schema: ${var.ml_schema}
+              src_catalog: ${var.src_catalog}
+              src_schema: ${var.src_schema}
+              bootstrap: ${var.kafka_bootstrap}
+              sasl_user: ${var.kafka_sasl_user}
+              sasl_pass: ${var.kafka_sasl_pass}
+        - task_key: train_initial
+          environment_key: ml
+          depends_on:
+            - task_key: simulate
+          notebook_task:
+            notebook_path: ./nba_ml_train_initial.py
+            base_parameters: *params
+
+    nba_ml_test_adaptation:
+      name: nba-ml-test-adaptation
+      environments:
+        - environment_key: ml
+          spec: *mlenv
+      tasks:
+        - task_key: test_adaptation
+          environment_key: ml
+          notebook_task:
+            notebook_path: ./nba_ml_test_adaptation.py
+            base_parameters: *params
+
+    nba_ml_kafka_probe:
+      name: nba-ml-kafka-probe
+      environments:
+        - environment_key: ml
+          spec: *mlenv
+      tasks:
+        - task_key: probe
+          environment_key: ml
+          notebook_task:
+            notebook_path: ./nba_ml_kafka_probe.py
+            base_parameters: *params
+
+    # promote the winning challenger -> @champion (the autonomous loop's deploy step; also runnable standalone)
+    nba_ml_evaluate:
+      name: nba-ml-evaluate
+      environments:
+        - environment_key: ml
+          spec: *mlenv
+      tasks:
+        - task_key: evaluate
+          environment_key: ml
+          notebook_task:
+            notebook_path: ./nba_ml_evaluate.py
+            base_parameters: *params
+
+    # batch re-score every member from lake eligibility with @champion (standalone; also the retrain loop's last step)
+    nba_ml_score_batch:
+      name: nba-ml-score-batch
+      environments:
+        - environment_key: ml
+          spec: *mlenv
+      tasks:
+        - task_key: score_batch
+          environment_key: ml
+          notebook_task:
+            notebook_path: ./nba_ml_score_batch.py
+            base_parameters: *params
+
+    # reconstruct REAL member journeys from the lake (silver sends + point-in-time snapshots) into offline-RL
+    # transitions (journey_transitions) the CQL unions with the simulator — the data flywheel. Reconstruction is
+    # PROVEN exact (nba_ml_journey_reconstruct_local.py). Empty table until real sends accrue -> graceful sim-only.
+    nba_ml_build_journey_set:
+      name: nba-ml-build-journey-set
+      environments:
+        - environment_key: ml
+          spec: *mlenv
+      tasks:
+        - task_key: build_journeys
+          environment_key: ml
+          notebook_task:
+            notebook_path: ./nba_ml_build_journey_set.py
+            base_parameters: *params
+
+    # PRODUCTION RL training (one Databricks process, SERVERLESS-NATIVE — pure-numpy CQL, NO pip install): trajectories
+    # -> BC + CQL -> OPE -> export Q-net (rl_qnet_dbx.json) + rl_card -> EVALUATE-GATE promote to live rl_qnet.json iff
+    # it clears the bar AND beats myopic. The RL scorer reloads rl_qnet.json each drain, so a passing promote is live
+    # with no restart. Proven: CQL 77% Upgraded vs myopic 0%. Run: databricks bundle run -t ml nba_ml_rl_train
+    nba_ml_rl_train:
+      name: nba-ml-rl-train
+      environments:
+        - environment_key: e                 # serverless env v4 = mlflow 2.22 + scikit-learn in base (loads propensity@champion)
+          spec: &rl_env { client: "4" }
+      tasks:
+        - task_key: rl_train
+          environment_key: e
+          notebook_task:
+            notebook_path: ./nba_ml_rl_train.py
+            base_parameters: &rl_train_params
+              ml_catalog: ${var.ml_catalog}
+              ml_schema: ${var.ml_schema}
+              out_name: rl_qnet_dbx.json
+              cql_steps: "40000"            # 40k = safe convergence margin (~half the serverless time of 80k)
+              union_real: "true"            # FLYWHEEL ON: train on REAL reconstructed journeys (build_journeys writes
+                                            # journey_transitions) unioned with the sim. Proven on realistic-mode data:
+                                            # grounding held Upgraded 0.40->0.42 / return 8.92->9.67, no collapse. The
+                                            # build_journeys window_hours scopes this to the realistic window (real outcomes only).
+              ground_champion: "false"      # response head stays f* (the generative model the activation layer samples);
+                                            # propensity@champion still too weak at demo scale. Flip true as it strengthens.
+              prior_strength: "60000"       # SIM-AS-DECAYING-PRIOR: cap sim to 60k pseudo-obs so its weight = 60k/(60k+
+                                            # N_real) shrinks as real journeys accumulate. With ~28k real/night, real
+                                            # reaches parity in ~2 nights and dominates after -> the policy TRACKS a
+                                            # shifted reality over a few nights (the "significance" knob). 0 = full sim.
+        - task_key: rl_promote
+          environment_key: e
+          depends_on:
+            - task_key: rl_train
+          notebook_task:
+            notebook_path: ./nba_ml_rl_promote.py
+            base_parameters: &rl_promote_params
+              ml_catalog: ${var.ml_catalog}
+              ml_schema: ${var.ml_schema}
+              src: rl_qnet_dbx.json
+              dst: rl_qnet.json
+              min_upgraded: "0.38"          # realistic-env floor: the disposition env's Upgraded ceiling is ~0.42 (the old
+                                            # 0.5 targeted the simpler pre-disposition env that hit 0.77). 0.38 clears a good
+                                            # policy + rejects a collapse back toward myopic (0.18). Promoted grounded@0.42.
+
+    # RL retrain schedule — daily build_journeys[24h] -> train[union_real] -> gate -> promote. UNPAUSED = the CONTINUOUS
+    # flywheel: every night the policy re-grounds on the last 24h of REAL journeys and promotes iff it clears the 0.38
+    # realistic floor AND beats myopic (a worse model leaves the champion untouched). The propensity 5-min loop is separate.
+    nba_ml_rl_retrain:
+      name: nba-ml-rl-retrain
+      schedule:
+        quartz_cron_expression: "0 0 2 * * ?"
+        timezone_id: UTC
+        pause_status: UNPAUSED
+      environments:
+        - environment_key: e
+          spec: *rl_env
+      tasks:
+        - task_key: build_journeys          # flywheel: refresh REAL journey transitions from the lake first
+          environment_key: e
+          notebook_task:
+            notebook_path: ./nba_ml_build_journey_set.py
+            base_parameters:
+              <<: *params
+              window_hours: "24"            # scheduled flywheel: reconstruct the last 24h of REAL journeys (the realistic-
+                                            # mode window) — excludes the ~1.8M historical happy-path sends so the daily
+                                            # retrain grounds on real outcomes, not stale optimism.
+        - task_key: rl_train
+          environment_key: e
+          depends_on:
+            - task_key: build_journeys
+          notebook_task:
+            notebook_path: ./nba_ml_rl_train.py
+            base_parameters: *rl_train_params
+        - task_key: rl_promote
+          environment_key: e
+          depends_on:
+            - task_key: rl_train
+          notebook_task:
+            notebook_path: ./nba_ml_rl_promote.py
+            base_parameters: *rl_promote_params
+        - task_key: rl_serve                # AFTER promote: register the promoted CQL as a UC model version (+ @champion)
+          environment_key: e                # AND re-point the nba-cql serving endpoint at it, so the hot-path dbx scorer
+          depends_on:                       # auto-tracks the champion. Idempotent (md5) — no new version when unchanged.
+            - task_key: rl_promote          # This was the missing link: the endpoint sat pinned to v1 while the loop only
+          notebook_task:                    # ever rewrote the UC-volume qnet (which only the async cloud scorer reads).
+            notebook_path: ./nba_ml_rl_serve.py
+            base_parameters: *params
+
+    # standalone serve (ad-hoc): re-register + re-point the endpoint from the CURRENT UC-volume champion, no retrain.
+    nba_ml_rl_serve:
+      name: nba-ml-rl-serve
+      environments:
+        - environment_key: e
+          spec: *rl_env
+      tasks:
+        - task_key: rl_serve
+          environment_key: e
+          notebook_task:
+            notebook_path: ./nba_ml_rl_serve.py
+            base_parameters: *params
+
+    # the RL POLICY scorer: streams nba.evaluations, runs the CQL critic (numpy Q-net), emits Q(s,a) per arm. The
+    # next-best-action optimizes long-term milestone value instead of immediate conversion. Replaces score_live.
+    nba_ml_score_rl:
+      name: nba-ml-score-rl
+      environments:
+        - environment_key: ml
+          spec: *mlenv
+      tasks:
+        - task_key: score_rl
+          environment_key: ml
+          notebook_task:
+            notebook_path: ./nba_ml_score_rl.py
+            base_parameters: *params
+
+    # the LIVE scorer (replaces the Java ml-scorer): streams nba.evaluations, scores @champion, emits nba.score.*
+    nba_ml_score_live:
+      name: nba-ml-score-live
+      environments:
+        - environment_key: ml
+          spec: *mlenv
+      tasks:
+        - task_key: score_live
+          environment_key: ml
+          notebook_task:
+            notebook_path: ./nba_ml_score.py
+            base_parameters: *params
+
+    # AUTONOMOUS LOOP — "a day" compressed to 5 minutes: pull the latest real outcomes -> retrain the challenger ->
+    # evaluate-gate promotes it to @champion if it wins. The streaming scorer reloads @champion each drain, so a
+    # promotion goes live with NO restart = self-improving. (Serverless cost recurs every 5 min — pause to stop.)
+    nba_ml_retrain_loop:
+      name: nba-ml-retrain-loop
+      schedule:
+        quartz_cron_expression: "0 0/5 * * * ?"
+        timezone_id: UTC
+        pause_status: UNPAUSED
+      environments:
+        - environment_key: ml
+          spec: *mlenv
+      tasks:
+        - task_key: build_training_set
+          environment_key: ml
+          notebook_task:
+            notebook_path: ./nba_ml_build_training_set.py
+            base_parameters: *params
+        - task_key: train
+          environment_key: ml
+          depends_on:
+            - task_key: build_training_set
+          notebook_task:
+            notebook_path: ./nba_ml_train.py
+            base_parameters: *params
+        - task_key: evaluate
+          environment_key: ml
+          depends_on:
+            - task_key: train
+          notebook_task:
+            notebook_path: ./nba_ml_evaluate.py
+            base_parameters: *params
+        - task_key: score_batch          # propagate the (possibly new) @champion to EVERY member from lake eligibility
+          environment_key: ml
+          depends_on:
+            - task_key: evaluate
+          notebook_task:
+            notebook_path: ./nba_ml_score_batch.py
+            base_parameters: *params
+
+    nba_ml_nightly:
+      name: nba-ml-nightly
+      schedule:
+        quartz_cron_expression: "0 30 1 * * ?"
+        timezone_id: UTC
+        pause_status: PAUSED
+      environments:
+        - environment_key: ml
+          spec: *mlenv
+      tasks:
+        - task_key: build_training_set
+          environment_key: ml
+          notebook_task:
+            notebook_path: ./nba_ml_build_training_set.py
+            base_parameters: *params
+        - task_key: simulate
+          environment_key: ml
+          notebook_task:
+            notebook_path: ./nba_ml_simulate.py
+            base_parameters: *params
+        - task_key: train
+          environment_key: ml
+          depends_on:
+            - task_key: build_training_set
+            - task_key: simulate
+          notebook_task:
+            notebook_path: ./nba_ml_train.py
+            base_parameters: *params
+        - task_key: evaluate
+          environment_key: ml
+          depends_on:
+            - task_key: train
+          notebook_task:
+            notebook_path: ./nba_ml_evaluate.py
+            base_parameters: *params
+        - task_key: score
+          environment_key: ml
+          depends_on:
+            - task_key: evaluate
+          notebook_task:
+            notebook_path: ./nba_ml_score.py
+            base_parameters: *params
+
+    nba_ml_score_intraday:
+      name: nba-ml-score-intraday
+      schedule:
+        quartz_cron_expression: "0 0/30 * * * ?"
+        timezone_id: UTC
+        pause_status: PAUSED
+      environments:
+        - environment_key: ml
+          spec: *mlenv
+      tasks:
+        - task_key: score
+          environment_key: ml
+          notebook_task:
+            notebook_path: ./nba_ml_score.py
+            base_parameters: *params
+
+    nba_ml_bandit:
+      name: nba-ml-bandit
+      schedule:
+        quartz_cron_expression: "0 0 * * * ?"
+        timezone_id: UTC
+        pause_status: PAUSED
+      environments:
+        - environment_key: ml
+          spec: *mlenv
+      tasks:
+        - task_key: bandit
+          environment_key: ml
+          notebook_task:
+            notebook_path: ./nba_ml_bandit.py
+            base_parameters: *params

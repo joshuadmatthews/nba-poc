@@ -1,0 +1,17 @@
+{
+  "state_delta_mse": 0.177,
+  "reward_mae": 0.5734,
+  "rollout": {
+    "myopic": {
+      "model": 3.54,
+      "true": 1.45
+    },
+    "sequencer": {
+      "model": 186.99,
+      "true": 15.51
+    }
+  },
+  "ordering_preserved": true,
+  "ensemble": 3,
+  "n_train": 85136
+}

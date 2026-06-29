@@ -1,0 +1,8 @@
+# NBA conversion sim — Databricks-free outbound hard-completion simulator (watch delivered actions -> /completion).
+# nba.member.facts is snappy-compressed; python-snappy 0.7.x uses the cramjam backend (prebuilt wheels).
+FROM docker.io/library/python:3.11-slim
+WORKDIR /app
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+COPY sim.py ./
+CMD ["python", "sim.py"]

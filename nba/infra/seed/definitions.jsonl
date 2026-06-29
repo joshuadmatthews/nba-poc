@@ -1,0 +1,134 @@
+ACTION:action_4b777281	
+ACTION:action_5f904e55	
+THROTTLE:email	{"entityType":"SYSTEM","entityId":"__throttle","key":"nba.throttle.email.daily","value":34,"valueType":"LONG","eventTs":1781399062813,"source":"throttle-lake"}
+THROTTLE:mail	{"entityType":"SYSTEM","entityId":"__throttle","key":"nba.throttle.mail.daily","value":0,"valueType":"LONG","eventTs":1781399062813,"source":"throttle-lake"}
+THROTTLE:push	{"entityType":"SYSTEM","entityId":"__throttle","key":"nba.throttle.push.daily","value":20,"valueType":"LONG","eventTs":1781399062813,"source":"throttle-lake"}
+THROTTLE:sms	{"entityType":"SYSTEM","entityId":"__throttle","key":"nba.throttle.sms.daily","value":7,"valueType":"LONG","eventTs":1781399062813,"source":"throttle-lake"}
+THROTTLE:voice	{"entityType":"SYSTEM","entityId":"__throttle","key":"nba.throttle.voice.daily","value":0,"valueType":"LONG","eventTs":1781399062813,"source":"throttle-lake"}
+ACTION:action_b857595a	
+ACTION:action_28990e80	
+ACTION:action_48440753	
+ACTION:action_b3514616	
+ACTION:action_2d442fa2	
+ACTION:dbz_probe	
+ACTION:action_00b9da74	
+ACTION:action_f423290a	
+ACTION:action_90fa1962	
+ACTION:action_7fbdc14e	
+ACTION:action_28d221b8	
+ACTION:action_2fb3baac	
+ACTION:action_1d6836ff	
+ACTION:action_ddd8e32d	
+ACTION:action_7be8a32c	
+ACTION:action_68f8fd4c	
+ACTION:action_5886947b	
+ACTION:action_b3464da9	
+ACTION:action_a266fb7d	
+ACTION:action_64d97cec	
+ACTION:action_9fae8e54	
+ACTION:action_3c90c3f2	
+ACTION:action_b9552c17	
+ACTION:action_609e3b6e	
+ACTION:action_0fa1cbfe	
+ACTION:action_380b032f	
+ACTION:action_d75bfb9e	
+ACTION:action_6ea336f8	
+ACTION:action_de964a73	
+ACTION:action_9c22ea22	
+ACTION:action_24dc7c9b	
+ACTION:action_43625a7a	
+ACTION:action_53681520	
+ACTION:action_624e937f	
+ACTION:action_seedtest	
+ACTION:action_activate_email	
+ACTION:action_activate_sms	
+ACTION:action_activate_push	
+ACTION:action_activate_voice	
+ACTION:action_onboard_email	
+ACTION:action_onboard_sms	
+ACTION:action_onboard_push	
+ACTION:action_onboard_voice	
+ACTION:action_engage_email	
+ACTION:action_engage_sms	
+ACTION:action_engage_push	
+ACTION:action_engage_voice	
+ACTION:action_upgrade_email	
+ACTION:action_upgrade_sms	
+ACTION:action_upgrade_push	
+ACTION:action_upgrade_voice	
+ACTION:action_winback_email	
+ACTION:action_survey_sms	
+MILESTONE:milestone_5c312840	
+GLOBAL_RULE:global_rule_2bc5cb23	{"id":"global_rule_2bc5cb23","name":"Comms cap 3/wk","logic":{"op":"all","conditions":[{"cmp":"lt","fact":"operator.comms.totalThisWeek","value":3}]},"factsUsed":["operator.comms.totalThisWeek"]}
+GLOBAL_RULE:global_rule_978a2f75	{"id":"global_rule_978a2f75","name":"No DNC","logic":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.profile.isDNC","value":false}]},"factsUsed":["operator.profile.isDNC"]}
+CHANNEL_RULE:channel_rule_mail_daily	{"id":"channel_rule_mail_daily","name":"Mail daily throttle (global)","logic":{"op":"all","conditions":[{"cmp":"lt","fact":"nba.throttle.mail.daily","value":800}]},"channel":"mail","factsUsed":["nba.throttle.mail.daily"]}
+CHANNEL_RULE:channel_rule_voice_rate	{"id":"channel_rule_voice_rate","name":"Voice rate (gate trickle)","logic":{"op":"all","conditions":[{"cmp":"lt","fact":"nba.throttle.voice.rate","value":60}]},"channel":"voice","factsUsed":["nba.throttle.voice.rate"]}
+CHANNEL_RULE:channel_rule_voice_daily	{"id":"channel_rule_voice_daily","name":"Voice daily throttle (global)","logic":{"op":"all","conditions":[{"cmp":"lt","fact":"nba.throttle.voice.daily","value":1500}]},"channel":"voice","factsUsed":["nba.throttle.voice.daily"]}
+CHANNEL_RULE:channel_rule_push_rate	{"id":"channel_rule_push_rate","name":"Push rate (gate trickle)","logic":{"op":"all","conditions":[{"cmp":"lt","fact":"nba.throttle.push.rate","value":2000}]},"channel":"push","factsUsed":["nba.throttle.push.rate"]}
+CHANNEL_RULE:channel_rule_push_daily	{"id":"channel_rule_push_daily","name":"Push daily throttle (global)","logic":{"op":"all","conditions":[{"cmp":"lt","fact":"nba.throttle.push.daily","value":50000}]},"channel":"push","factsUsed":["nba.throttle.push.daily"]}
+CHANNEL_RULE:channel_rule_sms_rate	{"id":"channel_rule_sms_rate","name":"SMS rate (gate trickle)","logic":{"op":"all","conditions":[{"cmp":"lt","fact":"nba.throttle.sms.rate","value":300}]},"channel":"sms","factsUsed":["nba.throttle.sms.rate"]}
+CHANNEL_RULE:channel_rule_sms_daily	{"id":"channel_rule_sms_daily","name":"SMS daily throttle (global)","logic":{"op":"all","conditions":[{"cmp":"lt","fact":"nba.throttle.sms.daily","value":8000}]},"channel":"sms","factsUsed":["nba.throttle.sms.daily"]}
+CHANNEL_RULE:channel_rule_6f500f77	{"id":"channel_rule_6f500f77","name":"Email cap 1000/wk","logic":{"op":"all","conditions":[{"cmp":"lt","fact":"operator.comms.emailsThisWeek","value":1000}]},"channel":"email","factsUsed":["operator.comms.emailsThisWeek"]}
+CHANNEL_RULE:channel_rule_fcc0b1a8	{"id":"channel_rule_fcc0b1a8","name":"Email daily throttle (global)","logic":{"op":"all","conditions":[{"cmp":"lt","fact":"nba.throttle.email.daily","value":50000}]},"channel":"email","factsUsed":["nba.throttle.email.daily"]}
+CHANNEL_RULE:channel_rule_1da11da3	{"id":"channel_rule_1da11da3","name":"Email rate (gate trickle)","logic":{"op":"all","conditions":[{"cmp":"lt","fact":"nba.throttle.email.rate","value":2000}]},"channel":"email","factsUsed":["nba.throttle.email.rate"]}
+ACTION:zz_typetest_ok	
+ACTION:action_87e6dc77	
+ACTION:action_plan_welcome	{"name":"Plan Welcome","channels":[{"channel":"email","contentKey":"tmpl.action_plan_welcome.email.v1"},{"channel":"sms","contentKey":"tmpl.action_plan_welcome.sms.v1"},{"channel":"push","contentKey":"tmpl.action_plan_welcome.push.v1"},{"channel":"voice","contentKey":"tmpl.action_plan_welcome.voice.v1"},{"channel":"mail","contentKey":"tmpl.action_plan_welcome.mail.v1"}],"inclusion":{"op":"all","conditions":[]},"completion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.respondedToOutreach","value":true}]},"autoExcludeOnCompletion":true,"ttlSeconds":600,"id":"action_plan_welcome","factsUsed":["operator.activity.respondedToOutreach"]}
+ACTION:action_reengage	{"name":"Re-engage Lapsed Member","channels":[{"channel":"email","contentKey":"tmpl.action_reengage.email.v1"},{"channel":"sms","contentKey":"tmpl.action_reengage.sms.v1"},{"channel":"push","contentKey":"tmpl.action_reengage.push.v1"},{"channel":"mail","contentKey":"tmpl.action_reengage.mail.v1"}],"inclusion":{"op":"all","conditions":[]},"completion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.respondedToOutreach","value":true}]},"autoExcludeOnCompletion":true,"ttlSeconds":600,"id":"action_reengage","factsUsed":["operator.activity.respondedToOutreach"]}
+ACTION:action_portal_registration	{"name":"Portal Registration","channels":[{"channel":"email","contentKey":"tmpl.action_portal_registration.email.v1"},{"channel":"sms","contentKey":"tmpl.action_portal_registration.sms.v1"},{"channel":"push","contentKey":"tmpl.action_portal_registration.push.v1"},{"channel":"voice","contentKey":"tmpl.action_portal_registration.voice.v1"},{"channel":"mail","contentKey":"tmpl.action_portal_registration.mail.v1"}],"inclusion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.respondedToOutreach","value":true}]},"completion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.registeredForPortal","value":true}]},"autoExcludeOnCompletion":true,"ttlSeconds":600,"id":"action_portal_registration","factsUsed":["operator.activity.registeredForPortal","operator.activity.respondedToOutreach"]}
+ACTION:action_login_reminder	{"name":"Portal Login Reminder","channels":[{"channel":"email","contentKey":"tmpl.action_login_reminder.email.v1"},{"channel":"sms","contentKey":"tmpl.action_login_reminder.sms.v1"},{"channel":"push","contentKey":"tmpl.action_login_reminder.push.v1"},{"channel":"mail","contentKey":"tmpl.action_login_reminder.mail.v1"}],"inclusion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.registeredForPortal","value":true}]},"completion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.loggedIn","value":true}]},"autoExcludeOnCompletion":true,"ttlSeconds":600,"id":"action_login_reminder","factsUsed":["operator.activity.loggedIn","operator.activity.registeredForPortal"]}
+ACTION:action_benefits_education	{"name":"Benefits Education","channels":[{"channel":"email","contentKey":"tmpl.action_benefits_education.email.v1"},{"channel":"sms","contentKey":"tmpl.action_benefits_education.sms.v1"},{"channel":"push","contentKey":"tmpl.action_benefits_education.push.v1"},{"channel":"mail","contentKey":"tmpl.action_benefits_education.mail.v1"}],"inclusion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.registeredForPortal","value":true}]},"completion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.viewedBenefits","value":true}]},"autoExcludeOnCompletion":true,"ttlSeconds":600,"id":"action_benefits_education","factsUsed":["operator.activity.registeredForPortal","operator.activity.viewedBenefits"]}
+ACTION:action_hra	{"name":"Health Risk Assessment","channels":[{"channel":"email","contentKey":"tmpl.action_hra.email.v1"},{"channel":"sms","contentKey":"tmpl.action_hra.sms.v1"},{"channel":"push","contentKey":"tmpl.action_hra.push.v1"},{"channel":"voice","contentKey":"tmpl.action_hra.voice.v1"},{"channel":"mail","contentKey":"tmpl.action_hra.mail.v1"}],"inclusion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.respondedToOutreach","value":true}]},"completion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.hraCompleted","value":true}]},"autoExcludeOnCompletion":true,"ttlSeconds":600,"id":"action_hra","factsUsed":["operator.activity.hraCompleted","operator.activity.respondedToOutreach"]}
+ACTION:action_hra_reminder	{"name":"Assessment Reminder","channels":[{"channel":"email","contentKey":"tmpl.action_hra_reminder.email.v1"},{"channel":"sms","contentKey":"tmpl.action_hra_reminder.sms.v1"},{"channel":"push","contentKey":"tmpl.action_hra_reminder.push.v1"},{"channel":"mail","contentKey":"tmpl.action_hra_reminder.mail.v1"}],"inclusion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.respondedToOutreach","value":true}]},"completion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.hraCompleted","value":true}]},"autoExcludeOnCompletion":true,"ttlSeconds":600,"id":"action_hra_reminder","factsUsed":["operator.activity.hraCompleted","operator.activity.respondedToOutreach"]}
+ACTION:action_pcp_selection	{"name":"PCP Selection","channels":[{"channel":"email","contentKey":"tmpl.action_pcp_selection.email.v1"},{"channel":"sms","contentKey":"tmpl.action_pcp_selection.sms.v1"},{"channel":"push","contentKey":"tmpl.action_pcp_selection.push.v1"},{"channel":"voice","contentKey":"tmpl.action_pcp_selection.voice.v1"},{"channel":"mail","contentKey":"tmpl.action_pcp_selection.mail.v1"}],"inclusion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.hraCompleted","value":true}]},"completion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.pcpSelected","value":true}]},"autoExcludeOnCompletion":true,"ttlSeconds":600,"id":"action_pcp_selection","factsUsed":["operator.activity.hraCompleted","operator.activity.pcpSelected"]}
+ACTION:action_care_manager_outreach	{"name":"Care Manager Outreach","channels":[{"channel":"voice","contentKey":"tmpl.action_care_manager_outreach.voice.v1"}],"inclusion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.pcpSelected","value":true}]},"completion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.careTeamEngaged","value":true}]},"autoExcludeOnCompletion":true,"ttlSeconds":600,"id":"action_care_manager_outreach","factsUsed":["operator.activity.careTeamEngaged","operator.activity.pcpSelected"]}
+ACTION:action_wellness_education	{"name":"Wellness Education","channels":[{"channel":"email","contentKey":"tmpl.action_wellness_education.email.v1"},{"channel":"sms","contentKey":"tmpl.action_wellness_education.sms.v1"},{"channel":"push","contentKey":"tmpl.action_wellness_education.push.v1"},{"channel":"mail","contentKey":"tmpl.action_wellness_education.mail.v1"}],"inclusion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.pcpSelected","value":true}]},"completion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.careTeamEngaged","value":true}]},"autoExcludeOnCompletion":true,"ttlSeconds":600,"id":"action_wellness_education","factsUsed":["operator.activity.careTeamEngaged","operator.activity.pcpSelected"]}
+ACTION:action_annual_wellness_visit	{"name":"Annual Wellness Visit","channels":[{"channel":"email","contentKey":"tmpl.action_annual_wellness_visit.email.v1"},{"channel":"sms","contentKey":"tmpl.action_annual_wellness_visit.sms.v1"},{"channel":"push","contentKey":"tmpl.action_annual_wellness_visit.push.v1"},{"channel":"voice","contentKey":"tmpl.action_annual_wellness_visit.voice.v1"},{"channel":"mail","contentKey":"tmpl.action_annual_wellness_visit.mail.v1"}],"inclusion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.pcpSelected","value":true}]},"completion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.awvCompleted","value":true}]},"autoExcludeOnCompletion":true,"ttlSeconds":600,"id":"action_annual_wellness_visit","factsUsed":["operator.activity.awvCompleted","operator.activity.pcpSelected"]}
+ACTION:action_med_adherence	{"name":"Medication Adherence","channels":[{"channel":"email","contentKey":"tmpl.action_med_adherence.email.v1"},{"channel":"sms","contentKey":"tmpl.action_med_adherence.sms.v1"},{"channel":"push","contentKey":"tmpl.action_med_adherence.push.v1"},{"channel":"mail","contentKey":"tmpl.action_med_adherence.mail.v1"}],"inclusion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.pcpSelected","value":true}]},"completion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.medAdherent","value":true}]},"autoExcludeOnCompletion":true,"ttlSeconds":600,"id":"action_med_adherence","factsUsed":["operator.activity.medAdherent","operator.activity.pcpSelected"]}
+ACTION:action_mammogram	{"name":"Mammogram Reminder","channels":[{"channel":"email","contentKey":"tmpl.action_mammogram.email.v1"},{"channel":"sms","contentKey":"tmpl.action_mammogram.sms.v1"},{"channel":"push","contentKey":"tmpl.action_mammogram.push.v1"},{"channel":"mail","contentKey":"tmpl.action_mammogram.mail.v1"}],"inclusion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.pcpSelected","value":true}]},"completion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.mammogramDone","value":true}]},"autoExcludeOnCompletion":true,"ttlSeconds":600,"id":"action_mammogram","factsUsed":["operator.activity.mammogramDone","operator.activity.pcpSelected"]}
+ACTION:action_a1c_test	{"name":"A1C Test Reminder","channels":[{"channel":"email","contentKey":"tmpl.action_a1c_test.email.v1"},{"channel":"sms","contentKey":"tmpl.action_a1c_test.sms.v1"},{"channel":"push","contentKey":"tmpl.action_a1c_test.push.v1"},{"channel":"mail","contentKey":"tmpl.action_a1c_test.mail.v1"}],"inclusion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.pcpSelected","value":true},{"cmp":"eq","fact":"operator.profile.diabetic","value":true}]},"completion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.a1cControlled","value":true}]},"autoExcludeOnCompletion":true,"ttlSeconds":600,"id":"action_a1c_test","factsUsed":["operator.activity.a1cControlled","operator.activity.pcpSelected","operator.profile.diabetic"]}
+ACTION:action_colonoscopy	{"name":"Colonoscopy Reminder","channels":[{"channel":"email","contentKey":"tmpl.action_colonoscopy.email.v1"},{"channel":"sms","contentKey":"tmpl.action_colonoscopy.sms.v1"},{"channel":"push","contentKey":"tmpl.action_colonoscopy.push.v1"},{"channel":"mail","contentKey":"tmpl.action_colonoscopy.mail.v1"}],"inclusion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.pcpSelected","value":true}]},"completion":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.colonoscopyDone","value":true}]},"autoExcludeOnCompletion":true,"ttlSeconds":600,"id":"action_colonoscopy","factsUsed":["operator.activity.colonoscopyDone","operator.activity.pcpSelected"]}
+MILESTONE:milestone_reached	{"name":"Reached","logic":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.respondedToOutreach","value":true}]},"id":"milestone_reached","factsUsed":["operator.activity.respondedToOutreach"]}
+MILESTONE:milestone_registered	{"name":"Registered","logic":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.registeredForPortal","value":true}]},"id":"milestone_registered","factsUsed":["operator.activity.registeredForPortal"]}
+MILESTONE:milestone_assessed	{"name":"Assessed","logic":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.hraCompleted","value":true}]},"id":"milestone_assessed","factsUsed":["operator.activity.hraCompleted"]}
+MILESTONE:milestone_engaged	{"name":"Engaged in Care","logic":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.pcpSelected","value":true},{"cmp":"eq","fact":"operator.activity.careTeamEngaged","value":true}]},"id":"milestone_engaged","factsUsed":["operator.activity.careTeamEngaged","operator.activity.pcpSelected"]}
+MILESTONE:milestone_stars	{"name":"STARS Compliant","logic":{"op":"all","conditions":[{"cmp":"eq","fact":"operator.activity.awvCompleted","value":true},{"cmp":"eq","fact":"operator.activity.medAdherent","value":true},{"cmp":"eq","fact":"operator.activity.mammogramDone","value":true}]},"id":"milestone_stars","factsUsed":["operator.activity.awvCompleted","operator.activity.mammogramDone","operator.activity.medAdherent"]}
+ACTION:action_benefits_intro	
+ACTION:action_getting_started_hc	
+ACTION:action_welcome_call	
+ACTION:action_complete_profile	
+ACTION:action_nurse_onboarding	
+ACTION:action_care_gap_alert	
+ACTION:action_screening_reminder	
+ACTION:action_care_manager_call	
+ACTION:action_health_survey	
+ACTION:action_screening_completion	
+ACTION:action_goal_call	
+ACTION:action_welcome	
+ACTION:action_winback	
+ACTION:action_intro_offer	
+ACTION:action_getting_started	
+ACTION:action_activation_call	
+ACTION:action_setup_checklist	
+ACTION:action_task_nudge	
+ACTION:action_quick_start	
+ACTION:action_onboarding_call	
+ACTION:action_power_tips	
+ACTION:action_feature_spotlight	
+ACTION:action_best_practices	
+ACTION:action_checkin_call	
+ACTION:action_survey	
+ACTION:action_upgrade_offer	
+ACTION:action_loyalty_perk	
+ACTION:action_success_story	
+ACTION:action_upgrade_call	
+THROTTLE:sms.daily	{"entityType":"SYSTEM","entityId":"__throttle","key":"nba.throttle.sms.daily","value":1990,"valueType":"LONG","eventTs":1782524051805,"source":"throttle-lake","origin":"lake","windowSeconds":300}
+THROTTLE:mail.daily	{"entityType":"SYSTEM","entityId":"__throttle","key":"nba.throttle.mail.daily","value":1157,"valueType":"LONG","eventTs":1782524051805,"source":"throttle-lake","origin":"lake","windowSeconds":300}
+THROTTLE:email.rate	{"entityType":"SYSTEM","entityId":"__throttle","key":"nba.throttle.email.rate","value":128,"valueType":"LONG","eventTs":1782524051805,"source":"throttle-lake","origin":"lake","windowSeconds":300}
+THROTTLE:sms.rate	{"entityType":"SYSTEM","entityId":"__throttle","key":"nba.throttle.sms.rate","value":162,"valueType":"LONG","eventTs":1782524051805,"source":"throttle-lake","origin":"lake","windowSeconds":300}
+THROTTLE:voice.daily	{"entityType":"SYSTEM","entityId":"__throttle","key":"nba.throttle.voice.daily","value":405,"valueType":"LONG","eventTs":1782524051805,"source":"throttle-lake","origin":"lake","windowSeconds":300}
+THROTTLE:voice.rate	{"entityType":"SYSTEM","entityId":"__throttle","key":"nba.throttle.voice.rate","value":21,"valueType":"LONG","eventTs":1782524051805,"source":"throttle-lake","origin":"lake","windowSeconds":300}
+THROTTLE:mail.rate	{"entityType":"SYSTEM","entityId":"__throttle","key":"nba.throttle.mail.rate","value":0,"valueType":"LONG","eventTs":1782524051805,"source":"throttle-lake","origin":"lake","windowSeconds":300}
+THROTTLE:push.daily	{"entityType":"SYSTEM","entityId":"__throttle","key":"nba.throttle.push.daily","value":3458,"valueType":"LONG","eventTs":1782524051805,"source":"throttle-lake","origin":"lake","windowSeconds":300}
+THROTTLE:push.rate	{"entityType":"SYSTEM","entityId":"__throttle","key":"nba.throttle.push.rate","value":281,"valueType":"LONG","eventTs":1782524051805,"source":"throttle-lake","origin":"lake","windowSeconds":300}
+THROTTLE:email.daily	{"entityType":"SYSTEM","entityId":"__throttle","key":"nba.throttle.email.daily","value":1838,"valueType":"LONG","eventTs":1782524051805,"source":"throttle-lake","origin":"lake","windowSeconds":300}

@@ -1,0 +1,54 @@
+import com.github.jengelman.gradle.plugins.shadow.transformers.AppendingTransformer
+
+plugins {
+    id 'application'
+    id 'com.github.johnrengelman.shadow' version '8.1.1'
+}
+
+repositories { mavenCentral() }
+
+ext { flinkVersion = '1.18.1' }
+
+dependencies {
+    // Apache Flink DataStream — the WHOLE NBA spine as ONE Flink job: snapshot -> rules/eligibility ->
+    // scoring -> routing -> the per-(member,action,channel) lifecycle STATE MACHINE (replaces Temporal,
+    // as a KeyedProcessFunction with timers). Runs EMBEDDED via a local MiniCluster (env.execute()) so it
+    // deploys as one container like the other services — no separate JobManager/TaskManager cluster.
+    implementation "org.apache.flink:flink-streaming-java:${flinkVersion}"
+    implementation "org.apache.flink:flink-clients:${flinkVersion}"
+    implementation "org.apache.flink:flink-connector-base:${flinkVersion}"
+    implementation 'org.apache.flink:flink-connector-kafka:3.1.0-1.18'
+    implementation 'org.apache.kafka:kafka-clients:3.7.1'
+
+    // Drools — the eligibility stage rebuilds the KieBase in-proc from the broadcast definitions
+    // (same compile path as rules-engine: structured-logic condition trees -> DRL -> KieBase).
+    implementation 'org.drools:drools-compiler:8.44.0.Final'
+    implementation 'org.drools:drools-mvel:8.44.0.Final'
+    implementation 'org.kie:kie-internal:8.44.0.Final'
+
+    implementation 'com.fasterxml.jackson.core:jackson-databind:2.17.2'
+    implementation 'redis.clients:jedis:5.1.5'                 // idmap resolve (shared with the classic path)
+    implementation 'org.slf4j:slf4j-simple:1.7.36'            // matches Flink 1.18's slf4j-api 1.7.x (else NOP logger)
+
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    // Flink operator test harnesses (drive a KeyedProcessFunction with no cluster, advance timers, assert output)
+    testImplementation "org.apache.flink:flink-test-utils:${flinkVersion}"
+    testImplementation "org.apache.flink:flink-streaming-java:${flinkVersion}:tests"
+    testImplementation "org.apache.flink:flink-runtime:${flinkVersion}:tests"
+}
+
+application { mainClass = 'ai.das.nba.flink.NbaFlinkApp' }
+java { toolchain { languageVersion = JavaLanguageVersion.of(17) } }   // Flink 1.18 supports Java 17
+test { useJUnitPlatform() }
+
+// Flink + Drools both rely on ServiceLoader + typesafe-config reference.conf; merge/append them in the fat jar
+// or the embedded MiniCluster (Pekko RPC) and the Drools KieServices fail to bootstrap.
+tasks.named('shadowJar') {
+    mergeServiceFiles()
+    transform(AppendingTransformer) { resource = 'reference.conf' }
+    exclude 'META-INF/*.SF'
+    exclude 'META-INF/*.DSA'
+    exclude 'META-INF/*.RSA'
+    zip64 true
+}

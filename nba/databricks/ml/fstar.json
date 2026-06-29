@@ -1,0 +1,17 @@
+{
+  "action_plan_welcome": {"b": 0.6, "daysSinceLogin": -0.012, "riskScore": 0.3, "portalLogins30d": 0.015},
+  "action_reengage": {"b": 0.3, "daysSinceLogin": 0.025, "portalLogins30d": -0.012},
+  "action_portal_registration": {"b": 0.1, "portalLogins30d": 0.05, "pagesViewed30d": 0.012, "age": -0.012},
+  "action_login_reminder": {"b": -0.2, "portalLogins30d": 0.05, "age": -0.010},
+  "action_benefits_education": {"b": -0.3, "pagesViewed30d": 0.015, "portalLogins30d": 0.025, "openCareGaps": 0.08},
+  "action_hra": {"b": -0.2, "riskScore": 0.5, "openCareGaps": 0.15, "age": 0.006},
+  "action_hra_reminder": {"b": -0.4, "riskScore": 0.5, "openCareGaps": 0.15},
+  "action_pcp_selection": {"b": -0.4, "riskScore": 0.7, "comorbidityCount": 0.12, "sdohBarrier": 0.4},
+  "action_care_manager_outreach": {"b": -1.6, "riskScore": 1.2, "comorbidityCount": 0.2, "erVisits12mo": 0.15, "sdohBarrier": 0.6, "age": 0.01},
+  "action_wellness_education": {"b": -1.2, "pagesViewed30d": 0.01, "riskScore": -0.3},
+  "action_annual_wellness_visit": {"b": -0.6, "age": 0.012, "openCareGaps": 0.12, "riskScore": 0.3},
+  "action_med_adherence": {"b": -0.8, "rxAdherencePDC": -1.2, "comorbidityCount": 0.15, "diabetic": 0.4},
+  "action_mammogram": {"b": -0.9, "age": 0.02, "openCareGaps": 0.2},
+  "action_a1c_test": {"b": -0.7, "diabetic": 1.0, "riskScore": 0.4, "openCareGaps": 0.15},
+  "action_colonoscopy": {"b": -1.0, "age": 0.025, "openCareGaps": 0.2}
+}

@@ -1,0 +1,38 @@
+# --- Secrets / credentials: NEVER commit (create these locally) ---
+*.env
+.env
+*.secret
+*.token
+*.pem
+*.key
+*.p12
+*.jks
+**/databricks.env
+**/ml.env
+.databricks/
+.databricks.cfg
+
+# --- Build artifacts ---
+**/build/
+**/dist/
+**/.gradle/
+**/node_modules/
+**/bin/
+**/out/
+**/__pycache__/
+*.class
+*.pyc
+
+# --- Run state ---
+.dlt_pipeline_id
+.stream_run_id
+*.pid
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+*.iml
+*.swp
+*~
+.DS_Store
+Thumbs.db

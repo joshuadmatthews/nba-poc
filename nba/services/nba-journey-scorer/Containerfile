@@ -1,0 +1,9 @@
+# NBA journey scorer — Databricks-free async scorer (consume nba.evaluations -> emit nba.score facts).
+# nba.evaluations is snappy-compressed; python-snappy 0.7.x uses the cramjam backend (prebuilt wheels, no
+# libsnappy/compiler needed) so kafka-python can decode it.
+FROM docker.io/library/python:3.11-slim
+WORKDIR /app
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+COPY scorer.py ./
+CMD ["python", "scorer.py"]

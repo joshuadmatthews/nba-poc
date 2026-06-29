@@ -1,0 +1,12 @@
+# NBA Action Library API — minimal Java (Javalin + JDBC + Postgres).
+FROM docker.io/library/gradle:8.7.0-jdk21 AS build
+WORKDIR /app
+COPY settings.gradle build.gradle ./
+COPY src ./src
+RUN gradle --no-daemon test shadowJar   # tests gate the image build (a red test fails the build, not silently skipped)
+
+FROM docker.io/library/eclipse-temurin:21-jre
+WORKDIR /app
+COPY --from=build /app/build/libs/*-all.jar /app/app.jar
+EXPOSE 7001
+CMD ["java", "-jar", "/app/app.jar"]

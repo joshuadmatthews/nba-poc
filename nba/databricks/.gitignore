@@ -1,0 +1,13 @@
+# NEVER commit Databricks credentials. The SP OAuth secret lives here, gitignored.
+databricks.env
+ml/ml.env
+ml.env
+.databricks.cfg
+*.secret
+*.token
+# local run-state (pipeline/run ids, watermarks)
+.dlt_pipeline_id
+.stream_run_id
+.gold_cdf_version
+# Databricks Asset Bundle local deploy state
+.databricks/

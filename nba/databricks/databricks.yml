@@ -1,0 +1,187 @@
+# NBA lakehouse as a Databricks Asset Bundle (DAB) — declarative IaC for the whole medallion.
+#
+# This replaces the imperative run_dlt_pipeline.py / run_kafka_jobs.py setup with a versioned,
+# deploy-from-fresh definition: one `databricks bundle deploy` recreates the DLT pipeline, every
+# serverless job, and the nightly rollover schedule on a brand-new workspace. The notebooks (the
+# *.py files alongside this) are synced by the bundle and referenced by relative path — they remain
+# the single source of the actual Spark logic; this file is the infrastructure around them.
+#
+# QUICK START on a fresh Databricks (see BUNDLE.md for the full runbook):
+#   databricks bundle deploy -t work
+#   databricks bundle run nba_setup           -t work   # schema + ckpt volume + bronze (once)
+#   databricks bundle run nba_datalake_ingest -t work   # drain Kafka -> silver/gold
+#   databricks bundle run nba_medallion_dlt   -t work   # one triggered DLT update
+#   databricks bundle run nba_out_produce     -t work   # emit gold deltas back to Kafka
+#   databricks bundle run nba_fact_reconcile  -t work
+# The rollover job is created on deploy and runs itself daily at 00:05 UTC.
+
+bundle:
+  name: nba-lake
+
+# Auth + workspace come from the target + your Databricks CLI profile / env (DATABRICKS_HOST,
+# DATABRICKS_CLIENT_ID, DATABRICKS_CLIENT_SECRET). Catalog/schema and the Kafka bridge are variables;
+# the Kafka creds default empty and MUST be supplied at deploy (env BUNDLE_VAR_* or --var), never
+# committed. Production should instead store them in a Databricks secret scope (see BUNDLE.md).
+variables:
+  catalog:
+    description: Unity Catalog catalog (the default workspace catalog on a fresh workspace).
+    default: workspace
+  schema:
+    description: Schema that holds the medallion tables.
+    default: nba_poc
+  kafka_bootstrap:
+    description: External Kafka bootstrap (SASL/SCRAM over the external TCP tunnel), host:port.
+    default: ""
+  kafka_sasl_user:
+    description: Kafka SASL/SCRAM username for Databricks serverless egress.
+    default: ""
+  kafka_sasl_pass:
+    description: Kafka SASL/SCRAM password — supply at deploy (BUNDLE_VAR_kafka_sasl_pass), do not commit.
+    default: ""
+
+targets:
+  # Local PoC workspace (the current <workspace-id> host). `databricks auth login` or a profile provides creds.
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://<your-databricks-workspace>.cloud.databricks.com
+
+  # A fresh Databricks at work. Set the host (or pass --profile) and deploy. mode: production pins the
+  # deploy under /Shared and disables the dev name-prefixing so resource names match this file exactly.
+  work:
+    mode: production
+    workspace:
+      host: https://CHANGE-ME.cloud.databricks.com
+      root_path: /Shared/.bundle/${bundle.name}/${bundle.target}
+
+# ---- resources ----------------------------------------------------------------------------------
+# Serverless throughout: notebook tasks carry no cluster spec, so they run on serverless jobs compute
+# (parity with the old jobs.submit calls). Base parameters mirror each notebook's dbutils.widgets.
+resources:
+  pipelines:
+    nba_medallion_dlt:
+      name: nba-medallion-dlt
+      serverless: true
+      catalog: ${var.catalog}
+      schema: ${var.schema}
+      continuous: false          # TRIGGERED by default (process-and-stop, cheap). Flip for a live demo.
+      development: false
+      configuration:
+        nba.bronze: ${var.catalog}.${var.schema}.bronze_member_activity
+      libraries:
+        - notebook:
+            path: ./nba_medallion_dlt.py
+
+  jobs:
+    # One-time bootstrap for a fresh workspace: schema + checkpoint volume + bronze append target.
+    nba_setup:
+      name: nba-setup
+      tasks:
+        - task_key: setup
+          notebook_task:
+            notebook_path: ./nba_setup.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+
+    # Streaming ingest: Kafka -> silver/gold (+ event-path throttle/comms counts). Default = availableNow
+    # drain-and-stop (backfill). For a live demo set trigger=continuous via `bundle run --params`.
+    nba_datalake_ingest:
+      name: nba-datalake-ingest
+      tasks:
+        - task_key: ingest
+          notebook_task:
+            notebook_path: ./nba_datalake_stream.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              bootstrap: ${var.kafka_bootstrap}
+              sasl_user: ${var.kafka_sasl_user}
+              sasl_pass: ${var.kafka_sasl_pass}
+              reset: "false"            # "true" = rebuild silver/gold from earliest
+              trigger: availableNow     # "continuous" = always-on live stream (costs while running)
+
+    # MEMBER SIMULATION (the source systems) — consumes nba.activations (DISPATCH), reads the member's FULL gold
+    # profile, applies the ground-truth response model -> HARD COMPLETION facts + fresh engagement telemetry onto
+    # datalake-inbound. THE ONLY hard-completion path (the activation layer emits dispositions / SOFT completions
+    # only). Self-loops (availableNow drain in a while-loop) so it runs as one long-lived run like the ingest.
+    # Belongs HERE (lake/data workspace), not ML — it's member simulation feeding the lake, and reads gold direct.
+    nba_source_sim:
+      name: nba-source-sim
+      tasks:
+        - task_key: simulate
+          notebook_task:
+            notebook_path: ./nba_source_sim.py
+            base_parameters:
+              src_catalog: ${var.catalog}
+              src_schema: ${var.schema}
+              bootstrap: ${var.kafka_bootstrap}
+              sasl_user: ${var.kafka_sasl_user}
+              sasl_pass: ${var.kafka_sasl_pass}
+              inbound_topic: datalake.streaming-inbound
+              act_topic: nba.activations
+
+    # Gold Change-Data-Feed -> re-emit delta-only facts back to Kafka (origin=lake). The gold -> member.facts
+    # BRIDGE that closes the loop, so it STREAMS continuously (readChangeFeed + checkpoint, availableNow drain
+    # loop) like the ingest + source-sim — NOT a one-shot batch. trigger=availableNow for a single backfill drain.
+    nba_out_produce:
+      name: nba-out-produce
+      tasks:
+        - task_key: out
+          notebook_task:
+            notebook_path: ./nba_out_produce.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              bootstrap: ${var.kafka_bootstrap}
+              sasl_user: ${var.kafka_sasl_user}
+              sasl_pass: ${var.kafka_sasl_pass}
+              trigger: continuous       # always-on bridge; "availableNow" = single drain + exit (backfill)
+              interval_seconds: "10"
+
+    # Re-emit newly action-referenced facts for the whole population (one-shot, after a rule change).
+    nba_fact_reconcile:
+      name: nba-fact-reconcile
+      tasks:
+        - task_key: reconcile
+          notebook_task:
+            notebook_path: ./nba_fact_reconcile.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              bootstrap: ${var.kafka_bootstrap}
+              sasl_user: ${var.kafka_sasl_user}
+              sasl_pass: ${var.kafka_sasl_pass}
+
+    # BOUNDARY ROLLOVER — the one SCHEDULED job. Daily 00:05 UTC full recompute + emit of channel
+    # throttle levels and per-member comms frequency (resets the daily throttle / rolls the comms week;
+    # the live counts otherwise come from the ingest stream's event path). Created on deploy.
+    nba_kafka_rollover:
+      name: nba-kafka-rollover
+      schedule:
+        quartz_cron_expression: "0 5 0 * * ?"
+        timezone_id: UTC
+      tasks:
+        - task_key: throttle
+          notebook_task:
+            notebook_path: ./nba_throttle_emit.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              bootstrap: ${var.kafka_bootstrap}
+              sasl_user: ${var.kafka_sasl_user}
+              sasl_pass: ${var.kafka_sasl_pass}
+              mode: triggered
+              window_seconds: "300"
+        - task_key: comms
+          notebook_task:
+            notebook_path: ./nba_comms_count.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              bootstrap: ${var.kafka_bootstrap}
+              sasl_user: ${var.kafka_sasl_user}
+              sasl_pass: ${var.kafka_sasl_pass}
+              mode: triggered
+              window_seconds: "604800"

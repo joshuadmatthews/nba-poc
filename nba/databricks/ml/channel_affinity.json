@@ -1,0 +1,7 @@
+{
+  "email": {"portalLogins30d": 0.03, "pagesViewed30d": 0.012, "age": -0.004},
+  "push": {"portalLogins30d": 0.05, "age": -0.008},
+  "sms": {"portalLogins30d": 0.04, "age": -0.004},
+  "voice": {"comorbidityCount": 0.22, "sdohBarrier": 0.8, "erVisits12mo": 0.15, "age": 0.002, "portalLogins30d": -0.025},
+  "mail": {"sdohBarrier": 0.6, "comorbidityCount": 0.12, "age": 0.003, "portalLogins30d": -0.03, "pagesViewed30d": -0.008}
+}

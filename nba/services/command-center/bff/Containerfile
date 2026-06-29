@@ -1,0 +1,9 @@
+# NBA Command Center BFF — Node + Apollo GraphQL.
+FROM docker.io/library/node:20-alpine
+WORKDIR /app
+COPY package.json ./
+RUN npm install --omit=dev
+# index.js + its local modules (databricks.js, rulesql.js, eventstream.js, explain.js)
+COPY *.js ./
+EXPOSE 4000
+CMD ["node", "index.js"]

@@ -1,0 +1,17 @@
+redpanda:
+  data_directory: /var/lib/redpanda/data
+  node_id: 0
+  seed_servers: []
+  empty_seed_starts_with_byoid: true
+  rpc_server: {address: 0.0.0.0, port: 33145}
+  advertised_rpc_api: {address: nba-redpanda, port: 33145}
+  admin:
+    - {address: 0.0.0.0, port: 9644}
+  kafka_api:
+    - {name: internal, address: 0.0.0.0, port: 9092, authentication_method: none}
+    - {name: external, address: 0.0.0.0, port: 19092, authentication_method: sasl}
+  advertised_kafka_api:
+    - {name: internal, address: nba-redpanda, port: 9092}
+    - {name: external, address: <tunnel-endpoint>, port: 37764}
+  sasl_mechanisms: [SCRAM-SHA-256]
+  developer_mode: true
