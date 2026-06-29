@@ -5,7 +5,7 @@ The Command Center is the operator surface: a live picture of the entire NBA sys
 ```mermaid
 flowchart LR
     UI[React UI :8490<br/>nginx] -->|/graphql · /topology · /stream| BFF[BFF :4000<br/>Apollo + SSE]
-    BFF -->|tail 7 topics| K[(Redpanda)]
+    BFF -->|tail 6 topics| K[(Redpanda)]
     BFF -->|REST| AL[Action Library :7001]
     BFF -->|SQL warehouse| DBX[(Databricks lake)]
 ```
@@ -50,7 +50,7 @@ Left: navigation (Live / Analytics / Operations / Studio). Center: the System Ma
 Container `ais-nba-bff`, port 4000. Four surfaces:
 
 ### SSE `/stream`
-Tails seven topics over native KafkaJS (with a registered **Snappy** codec) on an ephemeral consumer group `cc-live-systemmap-{ts}` (`fromBeginning:false` — live edge only). On connect it sends a `hello` frame (`{topology, stats, stateCounts, metrics}`) + backfills the last 40 events, then streams each Kafka event as `data:`. Every 2s it pushes a named `event: metrics` frame.
+Tails six topics — `datalake.streaming-inbound`, `nba.member.facts`, `nba.snapshots`, `nba.evaluations`, `nba.activations`, `nba.definitions` (`nba.facts` was dropped — the 21M-row "all facts, nobody subscribes" stream starved the observer) — over native KafkaJS (with a registered **Snappy** codec) on an ephemeral consumer group `cc-live-systemmap-{ts}` (`fromBeginning:false` — live edge only). On connect it sends a `hello` frame (`{topology, stats, stateCounts, metrics}`) + backfills the last 40 events, then streams each Kafka event as `data:`. Every 2s it pushes a named `event: metrics` frame.
 
 - **`emitterFor(topic, source, kind)`** attributes each event to the node that emitted it (router by `kind=router`; `nba.facts`→lake; `nba.member.facts` by `source`; unattributed member.facts→lake).
 - **`canonEntity`** resolves correlation to `entityId` (evals carry only `nbaId`, resolved via the snapshot's nbaId↔entityId pairing) — this is what makes the eval hop light up.

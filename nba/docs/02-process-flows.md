@@ -76,7 +76,7 @@ sequenceDiagram
     RO->>SM: CREATE / SUPPRESS (kind=router)
 ```
 
-- The **score loop is broken by a header**: the rules engine tags score-only re-emits `type=score`; the ml-scorer drops those at the header without deserializing. Without this, score → eval → score would spin forever.
+- The **score loop is broken by a header**: the rules engine tags score-only re-emits `type=score`; the scorer drops those at the header without deserializing. Without this, score → eval → score would spin forever.
 - The router reads only the coarse flags the rules engine folded onto each ChannelAction (`eligible`, `active`, `cancellable`, `softCompleted`, `hardCompleted`, `score`). It never touches Temporal or Redis (except one `readMaxBatch`).
 - The router holds a slot occupied by a *sent* action; it only supersedes an unsent (`cancellable`, state `CREATED`) action when a higher-scored candidate appears.
 
@@ -156,15 +156,16 @@ sequenceDiagram
     else criterion met
         Note over RU: action.completion tree passes on member facts
     end
-    RU->>RU: HSETNX nba:completed:{nbaId}[actionId] (permanent)
+    RU->>RU: detect transition → flag newCompleted[actionId]
     RU->>RO: next eval: hardCompleted=true
+    RO->>RO: emit nba.completion.{actionId} fact (durable, carried on snapshot)
     RO->>DC: HARD_COMPLETE (kind=router) → fan out to channels
     DC->>WF: hardComplete() to every nba-ca:{nbaId}:{actionId}:{ch}
     Note over WF: emit HARD_COMPLETED (terminal) → workflow closes
 ```
 
 - Hard completion is **channel-agnostic**: the goal (e.g. "meeting booked") is tracked at the action level and fanned out to every channel workflow for that action via `ACTION_CHANNELS`.
-- The latch (`HSETNX`) is permanent — the goal can only ever *trigger* it, never revoke it.
+- Permanence comes from the durable `nba.completion.{actionId}` fact the **action-router** publishes (carried perpetually on the snapshot), not from an `HSETNX` latch — the goal can only ever *trigger* the completion, never revoke it.
 - The durable per-eval completion/milestone facts are published by the **action-router**, not the rules engine: the rules engine folds `newCompleted[]` (criterion just true: `byCriterion && !already-signalled`) and `newMilestones[]` (tree just passed: `treePass && fact-absent`) onto the eval; the router publishes `nba.completion.{actionId}` / `nba.milestone.{id}` from those arrays and strips them before persisting the single `nba:eligibility:{nbaId}` (the perpetual `completed[]`/`milestones[]` stay). No diffing, no redundant eligibility-cache read.
 
 ## Flow G — Inbound pull serve, dispose, complete (no state machine)
@@ -241,7 +242,7 @@ The router emitted two competing sends; the **state machine** — not the router
 ```mermaid
 sequenceDiagram
     participant SRC as source topic
-    participant C as Consumer (e.g. ml-scorer)
+    participant C as Consumer (e.g. action-router)
     participant DLQ as nba.dlq.{consumer}
     participant CC as Command Center
     participant OP as Operator

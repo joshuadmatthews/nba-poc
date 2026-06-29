@@ -17,7 +17,7 @@ flowchart TB
         SB[snapshot-builder]
         RU[rules-engine]
         KIE[kie-server :7010]
-        ML[ml-scorer]
+        ML[nba-journey-scorer]
         AR[action-router]
         TW[temporal-worker]
         ALY[action-layer]
@@ -56,12 +56,12 @@ flowchart TB
 | `ais-nba-redpanda` | `redpandadata/redpanda:v24.2.7` | 9092 (internal, anon), 19092 (ext SASL), 8081/8082 | Kafka broker. Isolated from `ais-cdc-redpanda`. `--smp=1 --memory=1G`. |
 | `ais-nba-postgres` | `postgres:16-alpine` | 5432 | Action/rule defs + the 3 outbox tables. `wal_level=logical` for CDC. |
 | `ais-nba-redis` | `redis:7-alpine` | 6379 | Snapshots, idmap, latches, suppression, rulefacts. 256MB, `noeviction`, AOF. |
-| `ais-nba-temporal` | `temporalio/temporal` | 7233, 8233 | `server start-dev` (embedded DB — restart = fresh workflows, POC). |
+| `ais-nba-temporal` | `temporalio/temporal` | 7233, 8233 | `server start-dev` (embedded DB — restart = fresh workflows, POC). `run-nba-temporal.ps1` re-registers the custom search attributes **`NbaActionId` / `NbaChannel`** on every boot (start-dev is in-memory, so they vanish on restart and a missing key silently fails every workflow start). |
 | `ais-nba-connect` | `debezium/connect:2.7` | 8083 | Kafka Connect; runs the `nba-outbox` Debezium connector. EOS enabled. |
 | `ais-nba-snapshot-builder` | local Java | — | Snapshot LWW. |
 | `ais-nba-rules-engine` | local Java | — | Drools eligibility. |
 | `ais-nba-kie-server` | local Java | 7010 | Optional Drools scale-out. |
-| `ais-nba-ml-scorer` | local Java | — | Propensity. |
+| `ais-nba-journey-scorer` | local Python | — | Propensity (local stand-in: `nba.evaluations` → `nba.score.{action}.{channel}` facts; Databricks CQL model in prod). |
 | `ais-nba-action-router` | local Java | — | Winning channel. |
 | `ais-nba-temporal-worker` | local Java | — | State machine worker + bridges. |
 | `ais-nba-action-layer` | local Java | — | One comm · dispositions. |
@@ -116,14 +116,43 @@ Boot waves are encoded as `--label ais.boot.wave=N`:
 |------|-----------|
 | 15 | redpanda, postgres, redis |
 | 16 | temporal, kafka-tunnel, snapshot-builder, action-library, bff |
-| 17 | rules-engine, kie-server, command-center |
-| 18 | ml-scorer |
+| 17 | rules-engine, nba-journey-scorer, command-center |
+| 18 | nba-conversion-sim |
 | 19 | action-router |
 | 20 | temporal-worker |
 | 21 | action-layer |
 | 23 | connect (Debezium) |
 
-After wave 15: run `nba/infra/create-topics.ps1` to provision all topics + DLQs. The ml-scorer (18) before the router (19) gives the feature store a head start; the router does nothing until scores arrive anyway.
+After wave 15: run `nba/infra/create-topics.ps1` to provision all topics + DLQs. The scorer (17) before the router (19) gives scoring a head start; the router does nothing until scores arrive anyway.
+
+## One-command bring-up
+
+The whole stack boots from a single script — no manual wave-by-wave run scripts:
+
+```powershell
+pwsh nba/up.ps1 -Build    # first run: compiles every service image from source (~10-15 min)
+pwsh nba/up.ps1           # later runs: reuse cached images (~2-3 min); every step is idempotent
+pwsh nba/down.ps1         # tear down (add -Volumes to wipe data too)
+```
+
+`up.ps1` boots infra → topics → Temporal (registering `NbaActionId`/`NbaChannel`) → the app tier in dependency order, then seeds definitions + demo members and smoke-tests that facts flow through to snapshots/evaluations.
+
+## Reference engines (KStreams + Flink, shadow)
+
+Two **additive** reference engines accompany the classic spine, used by the load-test study (see [`../PERFORMANCE.md`](../PERFORMANCE.md)):
+
+| Container | Engine | Role |
+|-----------|--------|------|
+| `ais-nba-decision-engine` | **Kafka Streams** | reimplements the **snapshot** stage on RocksDB state + an Interactive-Query read surface (`:7020`). |
+| `ais-nba-flink-engine` | **Apache Flink** | reimplements the **whole spine** (snapshot → rules → score → route) plus the lifecycle **state machine that replaces Temporal**, as one job. |
+
+Both default to **`-Mode shadow`**: they consume in their own groups, write `.shadow` topics, and **drive nothing** — so they run safely alongside the classic services for diffing + throughput measurement. Bring them up with the classic stack via:
+
+```powershell
+pwsh nba/up.ps1 -Engines    # also starts decision-engine + flink-engine in shadow
+```
+
+(`-Mode authoritative` is the cutover path — emits the real topics + Redis write-through — and is out of scope for the shadow load tests.)
 
 ## Networking & external link
 

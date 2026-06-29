@@ -8,7 +8,7 @@
 The pipeline is a chain of single-purpose Kafka consumers over Redpanda + Redis + Temporal:
 
 ```
-member.facts ─▶ snapshot-builder ─▶ nba.snapshots ─▶ rules-engine ─▶ nba.evaluations ─┬▶ ml-scorer ─▶ (score facts) ─▶ member.facts ↺
+member.facts ─▶ snapshot-builder ─▶ nba.snapshots ─▶ rules-engine ─▶ nba.evaluations ─┬▶ scorer ─▶ (score facts) ─▶ member.facts ↺
                      │  (Redis snapshot, LWW)            (Drools eligibility)           └▶ action-router ─▶ (CREATE/SUPPRESS, kind=router) ─▶ member.facts
                      ▼                                                                                              │
               nba.definitions (broadcast: throttle, suppress, HOT)                                                 ▼
@@ -358,18 +358,30 @@ condition no longer holds. The completion must **stay** completed.
 **Why it's tricky.** Completion is a *historical* fact ("they did the thing"), not a *current* predicate.
 Re-deriving it each pass would let it flicker off when facts move.
 
-**How it's handled.** Both latch via Redis **`HSETNX`** (set-if-not-exists → never overwrites → permanent):
+**How it's handled — detect in the engine, publish in the router, carry on the snapshot.** The rules engine writes
+**no latch key**. It DETECTS the transition over the snapshot and builds a per-eval transition array; the
+action-router PUBLISHES the durable fact; the snapshot-builder folds that fact back so the engine reads it as a
+perpetual fact on every later eval:
 
 ```java
-// milestones — RulesEngine.evaluate
-if (logic != null && treePass(logic, f)) redis.hsetnx("nba:milestones:" + nbaId, key, ts);
-// hard completion (per action) — by criterion OR explicit nba.completion.{actionId} signal
-if (byCriterion || signalled) redis.hsetnx("nba:completed:" + nbaId, actionId, ts);
+// RulesEngine.evaluate — DETECT only; the durable fact (published by the router) rides the snapshot
+// milestones: done = the nba.milestone.* facts already on the snapshot UNION any whose logic passes now
+if (logic != null && treePass(logic, f) && !doneMs.containsKey(id)) newMs.add(id);     // transition (no fact yet)
+// hard completion (per action): by criterion this eval OR the durable nba.completion.{actionId} fact present
+boolean signalled = isTruthy(f.get("nba.completion." + actionId));
+if (byCriterion && !signalled) newCompleted.add(actionId);                              // transition (no fact yet)
+
+// ActionRouter.activate (~:116) — PUBLISH the durable facts straight off the transition arrays
+for (JsonNode aid : eval.path("newCompleted"))
+    emitFact(producer, outTopic, ..., "nba.completion." + aid.asText(), "true", "BOOL", "completion");
+for (JsonNode m : eval.path("newMilestones"))
+    emitFact(producer, outTopic, ..., "nba.milestone." + m.path("id").asText(), ..., "LONG", "milestone");
 ```
 
-Once latched, the completed set is **read back** from Redis and rides every subsequent eval — it is never
-re-derived from live facts. Milestones ride on `fullSig` (a fresh completion emits) but **not** `eligSig` (a
-milestone isn't an eligibility change), so completing one doesn't trigger a needless re-score.
+Once the router publishes the fact, the completed set is **carried perpetually as a snapshot fact** and rides
+every subsequent eval — it is never re-derived from live facts, and (because the disposition/completion fact is
+terminal on the snapshot) it can never flicker off. Milestones ride on `fullSig` (a fresh completion emits) but
+**not** `eligSig` (a milestone isn't an eligibility change), so completing one doesn't trigger a needless re-score.
 
 **The `autoExcludeOnCompletion` mode (default ON).** Hard completion drives eligibility:
 
@@ -582,7 +594,7 @@ outbound sends are countable too (an action can re-dispatch after `EXPIRED`).
 | Global throttle (§4) | population (broadcast) | **no** | members re-eval on their next snapshot; gate binds at send-time |
 | DISPATCH/CANCEL claim race (§5) | per activation | no | walker `step` gate (`SUPPRESSED`/`SUPPRESS_FAILED`); corr-id guard |
 | Supersede + hold (§6) | per member | no | holds while a sent action owns the slot; supersedes only a `cancellable` occupant |
-| Hard/soft completion latch (§9) | per `(member, action)` | no | `HSETNX` permanence |
+| Hard/soft completion (§9) | per `(member, action)` | no | durable `nba.completion.*` fact (router-published) carried perpetually on the snapshot |
 | Saturation HOT (§10) | per channel (broadcast) | **no** | expires at midnight; explicit reopen clears it |
 | Operator suppression (§11) | population (broadcast) | **no** | enforced at read edges; gold snapshot reconverges lazily |
 | Hot-path write-through (§12) | per `(member)` | no | best-effort Redis warm; bus re-applies (event-time LWW, commutative writers) |

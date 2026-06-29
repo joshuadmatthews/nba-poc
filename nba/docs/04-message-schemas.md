@@ -9,20 +9,26 @@ All topics are 1 partition / 1 replica today (the keying is partition-ready — 
 | Topic | Policy | Key | Producers | Consumers |
 |-------|--------|-----|-----------|-----------|
 | `datalake.streaming-inbound` | compact | source-defined | Source systems | Databricks lake ingest |
-| `nba.facts` | compact | `entityType:entityId` | Lake (out-produce), snapshot-builder (firehose) | ML scorer (feature store) |
-| `nba.member.facts` | compact | `entityType:entityId` | Lake, ml-scorer, action-library (incl. hot-path write-through), temporal (outbox), action-layer, action-router | snapshot-builder, temporal bridge, temporal disposition consumer |
+| `nba.facts` | ~~compact~~ | — | **RETIRED** | **RETIRED** — was the all-facts ML feature firehose; ML reads features from Unity Catalog now, nothing consumes it. Not created by `create-topics.ps1`; don't recreate it. (snapshot-builder still has a dormant firehose path keyed `entityType:entityId`.) |
+| `nba.member.facts` | compact | `entityType:entityId` | Lake, scorer (Databricks CQL / local nba-journey-scorer), action-library (incl. hot-path write-through), temporal (outbox), action-layer, action-router | snapshot-builder, temporal bridge, temporal disposition consumer |
 | `nba.snapshots` | compact | `nbaId` | snapshot-builder | rules-engine |
-| `nba.evaluations` | compact | `nbaId` | rules-engine | ml-scorer, action-router |
+| `nba.evaluations` | compact | `nbaId` | rules-engine | scorer (Databricks CQL `nba_ml_score_rl` / local nba-journey-scorer stand-in), action-router |
 | `nba.activations` | compact | `nbaId:actionId:channel:sm` | temporal (outbox), action-library (inbound tracking, direct) | action-layer, Databricks lake ingest (tracking) |
 | `nba.definitions` | compact | `TYPE:id` | action-library (outbox), snapshot-builder (forwarding) | rules-engine, temporal throttle-feed, action-router, KIE server |
 | `nba.dlq.snapshot-builder` | delete 7d | orig. key | snapshot-builder | Command Center |
-| `nba.dlq.ml-scorer-features` | delete 7d | orig. key | ml-scorer | Command Center |
-| `nba.dlq.ml-scorer-scorer` | delete 7d | orig. key | ml-scorer | Command Center |
+| ~~`nba.dlq.ml-scorer-features`~~ | delete 7d | orig. key | **RETIRED** (ml-scorer) | dead with the service |
+| ~~`nba.dlq.ml-scorer-scorer`~~ | delete 7d | orig. key | **RETIRED** (ml-scorer) | dead with the service |
 | `nba.dlq.action-router` | delete 7d | orig. key | action-router | Command Center |
 | `nba.dlq.action-layer` | delete 7d | orig. key | action-layer | Command Center |
 | `nba.dlq.temporal-disposition` | delete 7d | orig. key | temporal | Command Center |
 | `nba.dlq.temporal-bridge` | delete 7d | orig. key | temporal | Command Center |
 | `nba_connect_configs/offsets/status` | compact | — | Kafka Connect internal | Kafka Connect |
+
+### The `.shadow` sibling-topic convention
+
+The two **reference engines** (`nba-decision-engine`, the Kafka Streams spine port; `nba-flink-engine`, the Flink spine port) run side-by-side with the classic Redis spine in **shadow mode** (the default). In shadow mode they compute the full spine but write their outputs to `.shadow` siblings of the real topics — same shapes, zero blast radius — so the two implementations can be diffed against the live spine and latency-measured. Flip a reference engine to **authoritative** and it writes the real topics + Redis mirrors and becomes the writer (the classic services keep running untouched, for instant rollback).
+
+The shadow siblings are pre-created (idempotently) by each engine's `run.ps1` so the engine's Kafka sources don't fail on a missing topic: `nba.member.facts.shadow`, `nba.snapshots.shadow`, `nba.evaluations.shadow`, `nba.activations.shadow`, `nba.facts.shadow`, and the engine's own DLQ shadow (`nba.dlq.flink-engine.shadow`). Same key/policy as their real counterparts.
 
 ### The `nba.member.facts` `kind` header
 
@@ -32,7 +38,7 @@ All topics are 1 partition / 1 replica today (the keying is partition-ready — 
 |--------|----------|----------------------|---------------|
 | *(none)* + `origin=lake` | lake | snapshot it (it's a member fact) | — |
 | *(none)* + `source=hotpath` | action-library (hot-path write-through) | snapshot it — re-applies the presented facts as the SELF-HEAL (event-time LWW) if the optimistic Redis write lost a race | — |
-| `score` | ml-scorer | snapshot it + firehose to `nba.facts` | — |
+| `score` | scorer (Databricks CQL / local nba-journey-scorer) | snapshot it (firehose to `nba.facts` is dormant — topic retired) | — |
 | `state` | temporal (outbox) | snapshot it + firehose | — |
 | `throttle-suppress` | temporal (outbox) | route to `nba.definitions` as `THROTTLE_HOT:{ch}` | — |
 | `disposition` | action-layer | snapshot it | consume (disposition consumer) |
@@ -53,10 +59,10 @@ A **fact** is `{entityType, entityId, key, value, valueType, eventTs, source}` (
 | `operator.profile.smsConsent` | BOOLEAN | lake (← `sms_consent`) | SMS consent. |
 | `operator.comms.totalThisWeek` | LONG | lake comms-count | Total comms this rolling week. |
 | `operator.comms.emailsThisWeek` | LONG | lake comms-count | Emails this rolling week. |
-| `operator.plan` / `operator.mrr` / `operator.csat` / `operator.lastEvent` … | various | lake | Non-rulefact "color" — rides `nba.facts` only (future ML). |
+| `operator.plan` / `operator.mrr` / `operator.csat` / `operator.lastEvent` … | various | lake | Non-rulefact "color" (future ML). The old all-facts firehose (`nba.facts`) is retired — rich features now read from Unity Catalog / gold, not the bus. |
 | `nba.throttle.{channel}.daily` | LONG | lake throttle-emit | Global sends today on a channel. |
 | `nba.throttle.{channel}.rate` | LONG | lake throttle-emit | Global sends in the rate window. |
-| `nba.score.{actionId}.{channel}` | OBJECT | ml-scorer | Propensity score object (flattened to its `.score` double in the snapshot). |
+| `nba.score.{actionId}.{channel}` | OBJECT | scorer (Databricks CQL / local nba-journey-scorer) | Propensity score object (flattened to its `.score` double in the snapshot). |
 | `nba.actionstate.{actionId}.{channel}` | STRING | temporal | Current workflow state (one of the 11). |
 | `nba.disposition.{actionId}.{channel}` | STRING | action-layer | Raw provider status (e.g. `Opened`). |
 | `nba.completion.{actionId}` | STRING | action-library `/completion`; **action-router** (from the eval's `newCompleted[]` transition array) | Hard-completion signal (`"completed"`). |
@@ -69,7 +75,7 @@ A **fact** is `{entityType, entityId, key, value, valueType, eventTs, source}` (
 
 ## Message shapes
 
-### A member fact (`nba.facts` / `nba.member.facts`)
+### A member fact (`nba.member.facts`)
 
 ```json
 {
@@ -266,7 +272,7 @@ Other definition keys: `GLOBAL_RULE:{id}` / `CHANNEL_RULE:{id}` (a `{id, name, c
 
 ```json
 {
-  "consumer": "ml-scorer-scorer", "topic": "nba.evaluations",
+  "consumer": "action-router", "topic": "nba.evaluations",
   "partition": 0, "offset": 12345, "key": "nba_a1b2c3d4e5f6",
   "value": "{...original raw record...}", "headers": { "type": "eligibility" },
   "error": "<exception.toString()>", "dlqTs": 1749000020000

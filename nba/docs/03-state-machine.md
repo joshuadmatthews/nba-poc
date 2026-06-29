@@ -4,6 +4,8 @@ Each ChannelAction — one (member, action, channel) — runs exactly one durabl
 
 Source: `nba/services/nba-temporal/src/main/java/ai/das/nba/temporal/` — `ChannelActionWorkflowImpl.java`, `ActionActivitiesImpl.java`, `NbaTemporalWorker.java`, `ThrottleGate.java`, `BatchOrchestratorWorkflowImpl.java`.
 
+> **Flink alternative.** [`nba/services/nba-flink-engine/.../StateMachineFn.java`](../services/nba-flink-engine/src/main/java/ai/das/nba/flink/StateMachineFn.java) is a feature-complete replacement for the Temporal `ChannelActionWorkflow` — the same canonical states and throttle gate, with the member-keyed debounce/dedup pushed upstream into `MemberDedupFn` (a member-keyed pre-stage). The Temporal path and the Flink path are **mutually exclusive**: a deployment runs one or the other, never both.
+
 ## The 11 canonical states
 
 | State | Meaning | Terminal? |
@@ -179,4 +181,11 @@ Temporal requires deterministic workflow code — the event history must replay 
 | `NBA_PG_HOST`/`DB`/`USER`/`PASSWORD` | `ais-nba-postgres`/`actionlib`/`nba`/`nba` | Outbox DB. |
 | `NBA_MEMBER_FACTS` / `NBA_ACT_TOPIC` / `NBA_DEFINITIONS_TOPIC` | `nba.member.facts` / `nba.activations` / `nba.definitions` | Topics. |
 | `NBA_DISP_DLQ` / `NBA_BRIDGE_DLQ` | `nba.dlq.temporal-disposition` / `nba.dlq.temporal-bridge` | DLQs. |
+| `NBA_BRIDGE_CONCURRENCY` | `1` | Parallelism of the workflow-start path (see below). |
 | `NBA_FAULT_INJECT` | `""` | Test hook. |
+
+### Custom search attributes (Temporal)
+
+The ChannelAction workflows set two custom search attributes at start — **`NbaActionId`** and **`NbaChannel`** (both `Keyword`). The namespace **must have both registered before workers start**: `infra/run-nba-temporal.ps1` does this idempotently on boot. A missing one makes **every** `WorkflowClient.start` fail `INVALID_ARGUMENT` ("search attribute not defined") — which silently DLQs the whole activation layer (the bridge keeps failing to start workflows). 
+
+The start path itself is serial by default; **`NBA_BRIDGE_CONCURRENCY`** (default `1`) fans the per-record starts across a pool — the measured **~12/s serial → ~180/s** (starts are idempotent: deterministic workflowId + USE_EXISTING conflict policy, batch awaited before commit). See [../PERFORMANCE.md](../PERFORMANCE.md).

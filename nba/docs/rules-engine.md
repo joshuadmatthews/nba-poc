@@ -13,7 +13,7 @@ embedded — there are **no `.drl` files in the repo**; every rule is synthesize
 ## 1. What it is
 
 The rules engine is the **eligibility brain**. It answers, per member: *which (action, channel) pairs is this
-member allowed to receive right now?* It does **not** rank them (that's the ml-scorer) or send anything (that's
+member allowed to receive right now?* It does **not** rank them (that's the scorer) or send anything (that's
 the router + state machine). Its only output is `nba.evaluations` — a unified `channelActions[]` list where each
 entry self-describes its eligibility, live workflow state, score (carried over), and completion flags.
 
@@ -159,20 +159,23 @@ eligibility.
 2. **Inject the global throttle level** into `f` (`:162`): for every key in `GLOBAL_THROTTLE`, overwrite the
    member's value with the population level. This is the "make it global" step — a population-wide cap throttles
    *everyone*, regardless of whose snapshot last carried the level in.
-3. **Latch milestones** (`:168`): for each milestone whose `logic` tree passes `treePass(logic, f)`,
-   `HSETNX nba:milestones:{nbaId}` — permanent, never overwritten even if facts later move. Each milestone that
-   passes **and was fact-absent** this eval (`treePass && fact-absent`) is also collected into the per-eval
-   transition array **`newMilestones[]`** — the just-transitioned milestones (see §5.2).
-4. **Latch hard completions** (`:178`): for each action, if its `completion` tree passes **or** an explicit
-   `nba.completion.{actionId}` signal fact is truthy (`isTruthy`, `:444`), `HSETNX nba:completed:{nbaId}`.
-   Then read the latched completed set back (`:185`). Each action whose completion criterion **just** became true
-   (`byCriterion && !already-signalled`) is collected into the per-eval transition array **`newCompleted[]`** — the
-   just-completed actions (see §5.2).
-5. **Latch channel opt-outs** (`:190`): scan `nba.disposition.*` facts; if a channel's latest disposition equals
-   that channel's opt-out raw status (`OPTOUT_RAW`: email `Unsubscribe`, sms `STOP`, `:467`),
-   `HSETNX nba:optout:{nbaId}` for that channel. This is a **built-in, always-on compliance channel rule** — only
-   the hard, legally-binding opt-outs latch; a voice `Declined` / push `Dismissed` is a negative disposition the
-   model learns from, not a permanent removal.
+3. **Detect milestones** (`:219`): the completed milestone set is the durable `nba.milestone.{id}` **facts**
+   already on the snapshot (the **router** published them on a prior eval) UNION any milestone whose `logic` tree
+   passes `treePass(logic, f)` this eval. A milestone that passes **and has no durable fact yet** (`treePass &&
+   fact-absent`) is a *transition*: it's collected into the per-eval array **`newMilestones[]`** (see §5.2). The
+   engine never writes a latch key — the durable fact rides the snapshot and is read back here perpetually.
+4. **Detect hard completions** (`:236`): for each action, completion = its `completion` tree passes **or** the
+   durable `nba.completion.{actionId}` signal fact is truthy (`isTruthy`, `:565`) — the fact being either the
+   router's prior-eval publish or an explicit API/lake signal. An action whose completion criterion **just**
+   became true with no durable fact yet (`byCriterion && !signalled`) is a *transition*: collected into the
+   per-eval array **`newCompleted[]`** (see §5.2). The completed set feeds the auto-exclude filter and the
+   `hardCompleted` flag; the engine reads the durable fact for permanence but never writes a latch.
+5. **Derive channel opt-outs** (`:250`): scan `nba.disposition.*` facts; if a channel's latest disposition equals
+   that channel's opt-out raw status (`OPTOUT_RAW`: email `Unsubscribe`, sms `STOP`, `:588`), that channel is
+   opted out. This is a **built-in, always-on compliance channel rule** — only the hard, legally-binding opt-outs
+   gate; a voice `Declined` / push `Dismissed` is a negative disposition the model learns from, not a permanent
+   removal. Opt-out is **derived straight from the terminal disposition fact** (which is itself permanent on the
+   snapshot — a dead channel never re-fires), so there is no side-latch and it can never silently re-open.
 6. **Run eligibility** (`:205`): either inline (`session.fireAllRules()` over a fresh `KieSession`, default) or
    offloaded to the standalone KIE server (`NBA_RULES_MODE=kie`, see §9). Both yield the same hit-slug list.
 7. **Build the candidate set** (`:242`): every Drools hit, **plus** every action-channel that still has a live
@@ -181,15 +184,18 @@ eligibility.
 8. **Enrich each candidate** into a `ChannelAction` (`:259`):
    - `eligible` = Drools hit **and** not throttle-HOT **and** not auto-excluded-on-completion **and** not
      channel-opted-out (`:275`). A candidate that's neither eligible nor in-flight is dropped (`:276`).
-   - `score` carried over from the `nba.score.{aid}.{ch}` fact (null until the ml-scorer scores it, `:287`).
+   - `score` carried over from the `nba.score.{aid}.{ch}` fact (null until the scorer scores it, `:287`).
    - `workflowState` (the live state fact), `active` (`state ∈ ACTIVE_STATES`), `cancellable` (`state == CREATED`
      → router can SUPPRESS to replace) (`:290-292`).
-   - `hardCompleted` (from the latch), `softCompleted` (recomputed each eval: `softCompleted(a, ch, disp)`, the
-     channel's disposition vs the soft bar, `:296`), and `optedOut` surfaced for observability (`:299`).
+   - `hardCompleted` (from the detected completed set of step 4), `softCompleted` (recomputed each eval:
+     `softCompleted(a, ch, disp)`, the channel's disposition vs the soft bar, `:296`), and `optedOut` surfaced for
+     observability (`:299`).
    - `contentKey` chosen per member by **variant selection** (`contentKeyFor`, §8).
-9. **Ride the latched milestones** on the eval (`:309`) from `nba:milestones:{nbaId}` — the perpetual
-   `milestones[]`, permanent, read from Redis, never re-derived. The perpetual `completed[]` rides the same way
-   (from the latched completed set). Alongside them the eval carries the two **transient** transition arrays
+9. **Ride the completed milestones** on the eval (`:373`) — the perpetual `milestones[]`, derived in step 3 from
+   the durable `nba.milestone.*` facts on the snapshot, so it's permanent and never dropped (even when a
+   milestone's logic no longer holds). The perpetual `completed[]` rides the same way (from the durable
+   `nba.completion.*` facts + this-eval criterion passes). Both are carried perpetually as snapshot facts, not
+   read from a side-latch. Alongside them the eval carries the two **transient** transition arrays
    `newCompleted[]` / `newMilestones[]` from steps 3–4 — see §5.2.
 10. **Decide whether to emit** (§5.1) and write the eval + headers + cache.
 
@@ -209,7 +215,7 @@ The engine:
   `eligibility` when the eligible set moved, `score` when only scores did (`:351`).
 - Caches the full eval at `nba:evaluation:{nbaId}` (`:354`) for the action-library inbound pull-serve.
 
-That `type` header is the **loop-breaker**. The ml-scorer writes scores *as member facts*, which flow back into
+That `type` header is the **loop-breaker**. The scorer writes scores *as member facts*, which flow back into
 a new snapshot → a fresh eval. If the scorer re-scored on every eval it would spin forever (score → eval →
 score). Instead the scorer drops `type=score` evals by header without deserializing, re-scoring only on
 `type=eligibility`. The router consumes both (it always wants fresh scores). See
@@ -287,8 +293,8 @@ the authored percentage.
 By default the Drools session runs **inline** in the rules-engine pod. Setting `NBA_RULES_MODE=kie` (`:688`)
 offloads just the `fireAllRules` step to the standalone **`nba-kie-server`** (Javalin on `:7010`,
 `services/kie-server`): the engine POSTs `{nbaId, facts}` to `KIE_URL/evaluate` (`kieServerEval`, `:694`) and gets
-back the same hit slugs. Everything else (enrichment, latches, throttle, signatures, emit) stays in the
-rules-engine. The KIE server consumes `nba.definitions` and builds the **identical DRL** from the same condition
+back the same hit slugs. Everything else (enrichment, completion/milestone detection, throttle, signatures, emit)
+stays in the rules-engine. The KIE server consumes `nba.definitions` and builds the **identical DRL** from the same condition
 trees (its `Snap` and `buildDrl` are copies), so the same rules fire. If the KIE server is unreachable the eval
 is skipped (`:208`) and the snapshot re-flows later — fail-safe, not fail-open. This is purely a load-test /
 scale knob; the decision logic is unchanged.
@@ -297,12 +303,13 @@ scale knob; the decision logic is unchanged.
 
 ## 10. What the engine deliberately does *not* do
 
-- **It doesn't rank.** Scores are carried over from `nba.score.*` facts written by the ml-scorer; the engine
+- **It doesn't rank.** Scores are carried over from `nba.score.*` facts written by the scorer; the engine
   only attaches them.
-- **It no longer publishes completion/milestone facts.** It computes the `newCompleted[]` / `newMilestones[]`
-  transition arrays (§5.2) and rides them on the eval; the **action-router** publishes the durable
-  `nba.completion.{actionId}` / `nba.milestone.{id}` facts off those arrays. The engine still latches the
-  perpetual `nba:completed:*` / `nba:milestones:*` sets in Redis (steps 3–4).
+- **It no longer publishes completion/milestone facts, and it latches nothing.** It only *detects* transitions —
+  computing the `newCompleted[]` / `newMilestones[]` arrays (§5.2) and riding them on the eval; the
+  **action-router** publishes the durable `nba.completion.{actionId}` / `nba.milestone.{id}` facts off those
+  arrays. Permanence comes from those facts riding the snapshot perpetually (read back in steps 3–4), not from any
+  side-latch key — there is no `nba:completed:*` / `nba:milestones:*` Redis write.
 - **It doesn't enforce operator suppression.** `ACTION_SUPPRESS` is a no-op (§3). Enforcement is at the read
   edges (router won't activate, inbound serve strips) because a snapshot-driven engine can't re-fire a member on
   a bare suppress that carries no member fact.
@@ -321,7 +328,9 @@ scale knob; the decision logic is unchanged.
 | `NBA_DEFINITIONS_TOPIC` | `nba.definitions` | Definitions in. |
 | `NBA_SNAPSHOTS_TOPIC` | `nba.snapshots` | Snapshots in. |
 | `NBA_EVALUATIONS_TOPIC` | `nba.evaluations` | Evaluations out. |
-| `NBA_REDIS_HOST` | `nba-redis` | Latches (`nba:milestones:*`, `nba:completed:*`, `nba:optout:*`), eval cache (`nba:evaluation:*`), change-detection signatures (`nba:eval:fullsig:*`, `nba:eval:eligsig:*`). |
+| `NBA_REDIS_HOST` | `nba-redis` | Change-detection only: READS the single eligibility object (`nba:eligibility:{nbaId}`, written by the action-router) to skip duplicate emits. No latch/cache keys are written here — completion/milestone permanence rides snapshot facts, not Redis. |
+| `NBA_ELIG_CHANGE_DETECT` | `redis` | Change-detect source for the "skip duplicate eval" guard: `redis` reads the prior eligibility object from `nba:eligibility:{nbaId}`; `memory` keeps each member's last-emitted signatures in-process (no Redis read). |
+| `NBA_SCORE_TTL_SECONDS` | `0` | A score is a prediction with a shelf life: an `nba.score.*` fact whose `eventTs` is older than this TTL is treated as **absent** at eval (dropped), so the router never acts on a stale score and the now-unscored-but-eligible action re-triggers the scorer. Applies ONLY to `nba.score.*` — completions / lifecycle states / dispositions / milestones are durable and never expire. `0` (default) = off (carry-forever). |
 | `NBA_RULES_MODE` | `embedded` | `kie` offloads Drools to `nba-kie-server`. |
 | `NBA_KIE_URL` | `http://nba-kie-server:7010` | KIE server endpoint (kie mode). |
 | `NBA_THROTTLE_HOT_TTL_SECONDS` | `0` | Saturation HOT window; `0` = until midnight (positive = test override). |
@@ -335,7 +344,7 @@ nba.definitions ──▶ defs-consumer ──▶ applyDef ──▶ {actions, g
    (compacted)                          │            GLOBAL_THROTTLE, CHANNEL_HOT_UNTIL}
                                         └──structural change──▶ buildDrl() ──▶ KieHelper ──▶ volatile KieBase (hot-swap)
 
-nba.snapshots ──▶ evaluate() ──▶ build fact map ──▶ inject global throttle ──▶ latch milestones/completions/opt-outs
+nba.snapshots ──▶ evaluate() ──▶ build fact map ──▶ inject global throttle ──▶ detect milestones/completions + derive opt-outs
                                      │
                                      ├─▶ fireAllRules (or KIE server) ──▶ hit slugs "aid::ch"
                                      ├─▶ + live-workflow slugs (ACTIVE_STATES)

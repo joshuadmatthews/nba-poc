@@ -15,7 +15,7 @@ flowchart LR
     SRC[Source systems] -->|raw, heterogeneous| LAKE[Databricks Lake<br/>medallion · normalize]
     LAKE -->|canonical facts| SNAP[Snapshot Builder]
     SNAP -->|snapshot| RULES[Rules Engine<br/>eligibility]
-    RULES -->|evaluation| ML[ML Scorer<br/>propensity]
+    RULES -->|evaluation| ML[Scorer<br/>CQL prod / journey-scorer local]
     RULES -->|evaluation| ROUTER[Action Router<br/>pick winner]
     ML -.->|scores fold back| SNAP
     ROUTER -->|CREATE / SUPPRESS| SM[State Machine<br/>Temporal]
@@ -35,7 +35,7 @@ Alongside this async outbound loop runs a **synchronous inbound hot path**: when
 | Source systems speak different dialects | The **medallion lake** normalizes any raw shape into one canonical fact vocabulary. |
 | A decision needs *all* current facts at once | The **snapshot-builder** keeps a last-write-wins snapshot per member. |
 | Eligibility rules change constantly, no redeploys | The **rules-engine** compiles authored JSON rules into Drools at runtime. |
-| Rank the eligible options | The **ml-scorer** attaches a propensity score per ChannelAction. |
+| Rank the eligible options | A **scorer** (the Databricks CQL model in prod, or the local **nba-journey-scorer** stand-in) attaches a propensity score per ChannelAction. |
 | Only one action should win a channel | The **action-router** picks the top-scored eligible action and suppresses the rest. |
 | A send has a lifecycle (sent → delivered → engaged → converted) that must survive restarts | A **Temporal workflow** per ChannelAction holds the durable state machine. |
 | A burst of facts must not fire two competing sends | The state machine **debounces** and resolves the sibling race itself. |
@@ -54,14 +54,14 @@ See [hard-soft-completion.md](hard-soft-completion.md).
 ## Identity model
 
 - Externally a member is `entityType:entityId` (e.g. `OPERATOR:op-sg-0`).
-- On first sight the snapshot-builder (or ml-scorer) mints an internal `nbaId` = `nba_` + 12 hex chars, stored in Redis `nba:idmap:{entityType}:{entityId}` with `SETNX` (first-writer-wins, permanent).
+- On first sight the snapshot-builder mints an internal `nbaId` = `nba_` + 12 hex chars, stored in Redis `nba:idmap:{entityType}:{entityId}` with `SETNX` (first-writer-wins, permanent).
 - **Snapshots and evaluations are keyed by `nbaId`. Facts are keyed by `entityType:entityId`.** The two are joined by the id-map. The raw `memberId` (= `entityId`) rides the whole activation path so downstream systems never reverse-map.
 
 ## A ChannelAction is the atom
 
 The unit of everything below the rules engine is the **ChannelAction** — one (action, channel) pair for one member. It has:
 - a Drools-evaluated `eligible` flag,
-- an ml-scorer `score`,
+- a scorer `score`,
 - a live `workflowState` (one of 11),
 - coarse `active` / `cancellable` / `softCompleted` / `hardCompleted` flags,
 - exactly one Temporal workflow `nba-ca:{nbaId}:{actionId}:{channel}`.
@@ -71,6 +71,10 @@ Everything downstream — routing, the state machine, debounce, dispositions, an
 ## What "real-time" means here
 
 The system favors **eventual completion over short timeouts**. The pipeline is asynchronous end-to-end. A fact arriving produces a snapshot in milliseconds; the rules/score/route hops are sub-second on a warm pipeline; the state machine intentionally holds a **debounce window** (default 60s in prod) before sending so a burst settles into one decision. Outcomes (delivery, engagement, conversion) arrive minutes-to-days later and recirculate. Nothing is lost while waiting — the durable Temporal workflow and the compacted Kafka topics hold state.
+
+## Three reference implementations of the spine
+
+The decision spine has **three** interchangeable implementations: the **classic** path (Redis snapshot + Drools + router + Temporal — what these docs describe), a **KStreams** engine (snapshot on RocksDB + Interactive-Query reads), and a **Flink** engine (the whole spine — including a state machine that replaces Temporal — as one job). A measured throughput study compares them stage by stage — see [../PERFORMANCE.md](../PERFORMANCE.md) and the raw runs in [../infra/loadtest-results.md](../infra/loadtest-results.md). The whole stack comes up locally with one command: `pwsh nba/up.ps1 -Build`.
 
 ## Glossary
 

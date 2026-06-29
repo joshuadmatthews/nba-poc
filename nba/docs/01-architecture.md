@@ -8,7 +8,7 @@
 | **Databricks Lake** | PySpark / Delta | `datalake.streaming-inbound` (+ internal topics for analytics) | `nba.facts`, `nba.member.facts` | Medallion: normalize heterogeneous raw → canonical facts; analytics store; throttle/comms counts. |
 | **Snapshot Builder** | Java 21 | `nba.member.facts` | `nba.snapshots`, `nba.facts` (firehose), `nba.definitions` | Last-write-wins per-member snapshot in Redis; re-emit on every change. |
 | **Rules Engine** | Java 21 + Drools | `nba.snapshots`, `nba.definitions` | `nba.evaluations` | Compile authored rules → Drools at runtime; emit unified `channelActions[]` + the transient `newCompleted[]`/`newMilestones[]` transition arrays (the router publishes the durable facts off these — see below). |
-| **ML Scorer** | Java 21 | `nba.evaluations`, `nba.facts` | `nba.member.facts` (`kind=score`) | Attach a propensity score per eligible ChannelAction. |
+| **Scorer** | **Databricks CQL (RL Q-net) — prod**; `nba-journey-scorer` (Python) — local stand-in | `nba.evaluations` | `nba.member.facts` (`kind=score`) | Attach a propensity score per eligible ChannelAction. Prod = the trained CQL policy (`nba_ml_score_rl`, reads gold features over the SQL warehouse); local = the Databricks-free `nba-journey-scorer`. (The old standalone Java `ml-scorer` stub is retired.) |
 | **Action Router** | Java 21 | `nba.evaluations`, `nba.definitions` | `nba.member.facts` (`kind=router`/`completion`/`milestone`) | Pick the winning action per channel; suppress losers; bridge completions; **publish the durable completion/milestone facts** off the eval's transition arrays. |
 | **State Machine** | Java 21 + Temporal | `nba.member.facts` (`kind=router`/`disposition`/`completion`), `nba.definitions` | `nba.activations`, `nba.member.facts` (`kind=state`) via outbox | One durable workflow per ChannelAction; debounce, throttle-gate, dispatch, track. |
 | **Activation Layer** | Java 21 | `nba.activations` | `nba.member.facts` (`kind=disposition`) | Send exactly one comm; classify provider status into canonical dispositions. |
@@ -29,7 +29,7 @@ flowchart TD
     subgraph decide [Decision pipeline]
         SNAP[Snapshot Builder<br/>LWW per member]
         RULES[Rules Engine<br/>Drools eligibility]
-        ML[ML Scorer<br/>propensity]
+        ML[Scorer<br/>CQL · prod / journey-scorer · local]
         ROUTER[Action Router<br/>winning channel]
     end
 
@@ -115,13 +115,24 @@ See [04-message-schemas.md](04-message-schemas.md) for the full catalog.
 
 7. **One communication per action.** The activation layer is the single send point. The router guarantees one winner per channel; the state machine guarantees one in-flight workflow per ChannelAction; the activation layer sends one comm and classifies the provider's raw status into a canonical disposition.
 
-8. **Replay-safe timestamps.** Services that re-derive facts stamp the *decision time* (e.g. the ml-scorer stamps the eval's `evaluatedAt`, not wall-clock) so replays cannot overwrite newer state via LWW. (The side effect: you cannot measure those hops' processing latency from the fact timestamp.)
+8. **Replay-safe timestamps.** Services that re-derive facts stamp the *decision time* (e.g. the scorer stamps the eval's `evaluatedAt`, not wall-clock) so replays cannot overwrite newer state via LWW. (The side effect: you cannot measure those hops' processing latency from the fact timestamp.)
+
+9. **Scores can expire; everything else is durable.** The `nba.score.*` facts carry a shelf life: with `NBA_SCORE_TTL_SECONDS` set (rules-engine; default `0` = off) a score whose `eventTs` is older than the TTL is treated as **absent** at eval time — the channelAction emits `score=null` so the router won't act on it, and the now eligible-but-unscored action re-triggers the scorer. This applies **only** to `nba.score.*`; completions, states, dispositions, and milestones are durable and never expire. (LWW guards only out-of-order staleness; the TTL guards a score that is simply *old* in wall-clock time — a quiet member, a missed bulk-score run, a superseded model. See [snapshot-builder/SNAPSHOT.md](../services/snapshot-builder/SNAPSHOT.md).)
+
+## Reference implementations (classic / KStreams / Flink)
+
+The pipeline described above is the **classic spine**: a Redis-backed snapshot + Drools rules engine + action-router + a **Temporal** state machine. Two alternative spine implementations exist alongside it, for comparison under load (both run in shadow mode via `up.ps1 -Engines`):
+
+- **KStreams** ([`nba-decision-engine`](../services/nba-decision-engine/)) — replaces **only the snapshot stage**: snapshot state moves to **RocksDB** + an **Interactive-Query** read surface, deleting the `nba:snapshot` Redis store. The **Drools rules-engine is unchanged** — this engine simply *materializes* `nba.evaluations` into a queryable store too, which is what lets the action-router stop writing `nba:eligibility` to Redis.
+- **Flink** ([`nba-flink-engine`](../services/nba-flink-engine/)) — reimplements the **whole spine** (snapshot → rules → score → route → state machine) as one job. Its state machine **replaces Temporal** entirely (same canonical states + throttle gate; see [03-state-machine.md](03-state-machine.md)).
+
+The two engines are mutually exclusive with the classic stages they replace. See [../PERFORMANCE.md](../PERFORMANCE.md) for the measured per-stage throughput comparison across all three.
 
 ## Recirculation, concretely
 
 A single conversion illustrates the loop:
 
-1. A member books a meeting → the goal condition passes in the rules engine → `nba:completed:{nbaId}[actionId]` is latched (`HSETNX`, permanent).
+1. A member books a meeting → the rules engine DETECTS the goal condition passing → the **action-router** publishes the durable `nba.completion.{actionId}` fact, which the snapshot carries perpetually.
 2. The next evaluation carries `hardCompleted=true` on that ChannelAction.
 3. The router bridges `HARD_COMPLETE` → the Temporal workflow moves to terminal `HARD_COMPLETED` and emits a state fact.
 4. That state fact recirculates into the snapshot; the action's `active` flag goes false; `autoExcludeOnCompletion` drops it from eligibility.

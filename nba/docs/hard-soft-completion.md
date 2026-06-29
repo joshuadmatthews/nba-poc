@@ -20,8 +20,10 @@ nothing represents "the member actually did the thing we wanted." We add two exp
 - **Hard completion is action-level config over member facts.** An action carries a `completion` condition
   tree (same schema as `inclusion`/`exclusion`), evaluated per member. It can also be signalled directly by
   a `nba.completion.{actionId}` member fact (API or lake detector) — either path latches.
-- **Permanent + default-exclude, via a checkbox.** First time completion is satisfied, it's **latched**
-  permanently (`nba:completed:{nbaId}` HSETNX — the milestone pattern). The action carries
+- **Permanent + default-exclude, via a checkbox.** First time completion is satisfied, the rules engine detects
+  it and the action-router publishes a durable `nba.completion.{actionId}` fact that rides every later snapshot —
+  so it's **permanent** (the milestone pattern; permanence is the carried fact, not an `HSETNX` latch). The action
+  carries
   `autoExcludeOnCompletion` (default **true**): when true the system injects the exclusion automatically.
   Turn it off and completion is still **tracked/latched** (for the label and for your own rules to
   reference) — only the *automatic* gate is removed. Authoring eligibility rules is always available
@@ -40,9 +42,12 @@ nothing represents "the member actually did the thing we wanted." We add two exp
 ## Hard completion lives in the eligibility layer (milestone-sibling), NOT the workflow
 
 Hard completion is **exactly the milestone pattern, scoped per-action and wired to exclusion** — a
-rules-engine/eligibility concept, not a Temporal state. The rules engine already latches milestones
-(`HSETNX nba:milestones:{nbaId}`) and rides them on every eval; hard completion is its sibling
-(`HSETNX nba:completed:{nbaId}[actionId]`) that *also* excludes the action. So the Temporal workflow is
+rules-engine/eligibility concept, not a Temporal state. The rules engine **detects** a milestone transition
+(its `logic` tree passes) and the **action-router publishes** the durable `nba.milestone.{id}` fact, which then
+rides every subsequent snapshot/eval; hard completion is its sibling — the engine detects the per-action
+`completion` goal, the router publishes the durable `nba.completion.{actionId}` fact, and the completion *also*
+excludes the action. (Neither is a `HSETNX` latch key: permanence comes from the durable fact carried perpetually
+on the snapshot.) So the Temporal workflow is
 **untouched in Phase 1** — a completed action flips to `eligible: false` and drops off the eval once its
 workflow reaches the terminal `HARD_COMPLETED` state, so the router + inbound serve never see it again
 (retired, every channel). The durable, permanent record of completion is that terminal `HARD_COMPLETED`
@@ -53,7 +58,7 @@ engine evaluates **both** soft and hard each pass:
 
 | Signal | Grain | How the rules engine decides it | Surfaced as | Effect |
 |---|---|---|---|---|
-| **hard completed** | **action** (all channels) | `completion` tree passes **or** `nba.completion.{actionId}` truthy → `HSETNX nba:completed` (permanent, milestone-style) | `hardCompleted` flag on the action's `channelActions[]` entry; the durable record is the terminal `HARD_COMPLETED` workflow state (rides up into the lake as the ML label) | **retire** via auto-exclude (when `autoExcludeOnCompletion != false`) |
+| **hard completed** | **action** (all channels) | rules engine **detects**: `completion` tree passes **or** durable `nba.completion.{actionId}` fact truthy → flagged on `newCompleted[]` if it's the first pass (no fact yet); the **action-router publishes** the durable fact, which rides every later snapshot for permanence (milestone-style, no latch key) | `hardCompleted` flag on the action's `channelActions[]` entry; the durable record is the terminal `HARD_COMPLETED` workflow state (rides up into the lake as the ML label) | **retire** via auto-exclude (when `autoExcludeOnCompletion != false`) |
 | **soft completed** | **(action, channel)** | the disposition funnel fact reached the channel's bar (`CHANNEL_FUNNEL` terminal, or per-action override) | `softCompleted` on the ChannelAction | informational + engagement feature; re-send still guarded by the channel's `ttlSeconds` |
 
 Existing Temporal `nba.actionstate.*` delivery lifecycle (`CREATED → IN_PROCESS → PRESENTED → … →
@@ -90,12 +95,12 @@ journey is visible in the lake and the model can learn to surface that action in
   the lean snapshot. New `POST /completion {entityId, actionId, source?}` → emits
   `nba.completion.{actionId}=completed` member fact via the outbox (mirrors `/dispositions`). All doc-only
   fields → no DB migration. **This is the path an INBOUND member takes to hard completion** — see below.
-- **rules-engine** (`RulesEngine.java`): each eval — latch hard completion (`completion` tree passes OR
-  `nba.completion.{actionId}` truthy) into `nba:completed:{nbaId}` (HSETNX, beside the milestone latch);
-  derive soft completion per (action,channel) from the disposition funnel facts; **auto-exclude** completed
-  actions from `hits` when `autoExcludeOnCompletion != false` (post-eligibility filter, like the
-  `CHANNEL_HOT` skip); surface `softCompleted`/`hardCompleted` on each `channelActions[]` entry (the
-  `hardCompleted` flag added to `fullSig` so a fresh completion emits) — there is no separate `completed[]` block.
+- **rules-engine** (`RulesEngine.java`): each eval — **detect** hard completion (`completion` tree passes OR
+  durable `nba.completion.{actionId}` fact truthy), reading the durable fact off the snapshot for permanence
+  (no latch key written, beside the milestone detection); derive soft completion per (action,channel) from the
+  disposition funnel facts; **auto-exclude** completed actions from `hits` when `autoExcludeOnCompletion != false`
+  (post-eligibility filter, like the `CHANNEL_HOT` skip); surface `softCompleted`/`hardCompleted` on each
+  `channelActions[]` entry (the `hardCompleted` flag added to `fullSig` so a fresh completion emits).
   It also computes, per eval, the **transition arrays** — `newCompleted[]` (actions whose completion criterion
   just became true: `byCriterion && !already-signalled`) and `newMilestones[]` (milestone trees that just
   passed: `treePass && fact-absent`) — and hands them to the action-router on the eval message; the rules-engine

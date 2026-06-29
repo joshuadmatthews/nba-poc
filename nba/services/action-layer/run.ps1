@@ -18,7 +18,7 @@ $ARGS = @(
   '--network', 'aiservices_default', '--network-alias', 'nba-action-layer',
   '--restart', 'unless-stopped', '--label', 'ais.boot.wave=21',
   '-e', 'NBA_BOOTSTRAP=nba-redpanda:9092',
-  '-e', "NBA_SEND_DELAY_MS=$SendDelayMs"
+  '-e', "NBA_DISPOSITION_STEP_MS=$SendDelayMs"   # the Java reads NBA_DISPOSITION_STEP_MS (funnel-step / cancel-window delay)
 )
 if ($FaultInject) { $ARGS += @('-e', "NBA_FAULT_INJECT=$FaultInject") }
 $ARGS += $IMG

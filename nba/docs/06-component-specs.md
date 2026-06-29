@@ -42,7 +42,7 @@ Common env defaults: `NBA_BOOTSTRAP=nba-redpanda:9092`, `NBA_REDIS_HOST=nba-redi
 
 **DRL generation.** Per action-channel: `rule "elig::{action}::{channel}" when Snap({inclusion} && {global} && {channel}) [not Snap({exclusion})] then results.add("{action}::{channel}")`. Comparators map to MVEL with type-defaulted `getOr` (absent number→0, boolean→false, string→""), so missing facts never wrongly suppress new members. `.rate` channel rules are excluded from eligibility DRL (they are Temporal-gate pacing, not eligibility).
 
-**Evaluation steps.** (1) build typed fact map from snapshot; (2) inject `GLOBAL_THROTTLE` levels as facts; (3) milestone latch (`HSETNX nba:milestones`); (4) hard-completion latch (`HSETNX nba:completed` when `completion` tree passes or `nba.completion.{action}` truthy); (5) fire Drools (embedded `KieSession` or HTTP to KIE server); (6) candidate set = Drools hits ∪ in-flight ACTIVE_STATES; (7) assemble each ChannelAction with flags + content-variant selection.
+**Evaluation steps.** (1) build typed fact map from snapshot; (2) inject `GLOBAL_THROTTLE` levels as facts; (3) detect milestone transitions (milestone tree just passed, durable fact absent → `newMilestones[]`); (4) detect hard-completion transitions (`completion` tree passes or `nba.completion.{action}` truthy, not yet signalled → `newCompleted[]`) — the **action-router** publishes the durable facts off these arrays; (5) fire Drools (embedded `KieSession` or HTTP to KIE server); (6) candidate set = Drools hits ∪ in-flight ACTIVE_STATES; (7) assemble each ChannelAction with flags + content-variant selection.
 
 **Completion/milestone TRANSITIONS.** The engine no longer publishes completion/milestone facts. Instead each eval carries two transient TRANSITION arrays the engine computes once off the snapshot: `newCompleted[]` (action whose completion criterion just became true — `byCriterion && !already-signalled`) and `newMilestones[]` (milestone tree that just passed — `treePass && fact-absent`). The **action-router** publishes the durable `nba.completion.{action}` / `nba.milestone.{id}` facts off these arrays (see Action Router). The perpetual `completed[]`/`milestones[]` on the eval are unchanged.
 
@@ -52,7 +52,7 @@ Common env defaults: `NBA_BOOTSTRAP=nba-redpanda:9092`, `NBA_REDIS_HOST=nba-redi
 
 **Suppression is NOT enforced here** (a snapshot-driven engine never re-fires on a bare suppress). Enforced at read edges (router + inbound serve).
 
-**Config.** `NBA_RULES_MODE=embedded|kie`, `NBA_KIE_URL=http://nba-kie-server:7010`, `NBA_THROTTLE_HOT_TTL_SECONDS=0` (0 = saturation until midnight UTC).
+**Config.** `NBA_RULES_MODE=embedded|kie`, `NBA_KIE_URL=http://nba-kie-server:7010`, `NBA_THROTTLE_HOT_TTL_SECONDS=0` (0 = saturation until midnight UTC), `NBA_SCORE_TTL_SECONDS=0` (treat an `nba.score.*` fact older than this as absent at eval time → the router won't act on a stale score and the eligible-but-unscored eval re-triggers the scorer; `0` = carry-forever).
 
 ---
 
@@ -64,19 +64,45 @@ Standalone Drools decision service. Tails `nba.definitions` (own random group) t
 
 ---
 
-## ML Scorer — RETIRED (replaced by the Databricks CQL scoring stream)
+## ML Scorer — RETIRED
 
-> **The Java `ml-scorer` (heuristic stub) is removed** — service dir deleted, container `ais-nba-ml-scorer` retired.
-> It was a placeholder propensity heuristic standing in for a real model. The **live scorer is now the Databricks
-> CQL stream** (`nba_ml_score_rl`, job `nba-ml-score-rl`): it consumes `nba.evaluations`, scores each eligible
-> ChannelAction by its **channel's** offline-RL Q-value (the disposition-aware CQL policy), and emits
-> `nba.score.{action}.{channel}` to `nba.member.facts` (`kind=score`, **drops `type=score` by header** — the same
-> loop-break). See [11-ml-pipeline.md](11-ml-pipeline.md). The `nba.dlq.ml-scorer-*` topics are dead with the service.
+> **The Java `ml-scorer` (heuristic stub) is removed** — service dir deleted, container `ais-nba-ml-scorer` and its `nba.dlq.ml-scorer-*` topics retired. **Replaced by the Databricks CQL scoring stream** (`nba_ml_score_rl`, job `nba-ml-score-rl`; see [11-ml-pipeline.md](11-ml-pipeline.md)) for the live offline-RL scorer, and the **local `nba-journey-scorer`** (below) as the Databricks-free stand-in. Both consume `nba.evaluations` and emit `nba.score.{action}.{channel}` to `nba.member.facts` (`kind=score`, dropping `type=score` re-emits — the same loop-break). The hot path's in-process scorer is `nba-model` (below).
 
-(Historical: the stub model was `0.5 − min(0.30, daysSinceLogin×0.01) + … + channelPrior`, clamped `[0.01, 0.99]` — a
-transparent heuristic, never a learned model. Output keying/replay-safety semantics are unchanged in the CQL scorer.)
+---
 
-**Failure / cold start.** Scorer spins on `featuresReady` (never scores against an empty store). A bad eval → DLQ, batch still commits. If scores aren't ready when an eval arrives, the eval's `score` fields are absent and the router does nothing until the score fact round-trips.
+## NBA Model (local Q-net scorer)
+
+`nba/services/nba-model/app.py` (`model.py`) · container `ais-nba-model:7011` · **Python** (FastAPI + numpy) · boot wave 16
+
+**Purpose.** Serve the offline-RL CQL Q-net in-process for the action-library hot path (`scorer=local`, the default), so `POST /disposition` / hot-path `GET /next-action` get per-`(action,channel)` Q-values without the ~12s Databricks Model-Serving round-trip. Pure numpy, model-agnostic (reads its dims from the baked artifact).
+
+**I/O.** `POST /score {facts, candidates[], nbaId?}` → `{scores:[{actionId,channel,score}], holdScore, model_ms, state_dim}`. `GET /healthz` → artifact health. No Kafka.
+
+**Config.** `NBA_QNET_PATH=/app/rl_qnet.json` (set in the Containerfile; the Q-net artifact is **baked into the image** by `run.ps1` — default stages `nba/databricks/ml/rl_qnet.json`, or `-QnetPath <file>` bakes a specific artifact). No env in `run.ps1` itself.
+
+---
+
+## Decision Engine (Kafka Streams reference impl)
+
+`nba/services/nba-decision-engine/.../DecisionEngine.java` · container `ais-nba-decision-engine:7020` · boot wave 16
+
+**Purpose.** A Kafka Streams port of the classic SPINE (snapshot-builder + rules-engine + action-router) as ONE app over co-located keyed state — a faithful 1:1 port reusing the classic services' pure functions (event-time LWW merge, the JSON-logic→Drools `KieBase` build, the router slot/dedup decision), swapping only the shell (hand-rolled EOS poll loops → KStreams Processor/KTable, `EXACTLY_ONCE_V2`). Scoring/features stay external (the dbx scorer consumes `nba.evaluations` and emits `nba.score.*` exactly as today). Runs **alongside** the classic spine for diffing + latency measurement.
+
+**I/O.** In: `nba.member.facts` (own group) + `nba.definitions` (broadcast). Out (mode-dependent): `nba.snapshots`, `nba.evaluations`, `nba.member.facts` (`kind=router`), `nba.facts` firehose, `nba.dlq.decision-engine`. Maintains a **RocksDB snapshot store** (replaces the `nba:snapshot` Redis read) and an **eligibility store** materialized off `nba.evaluations` (replaces `nba:eligibility`), both served over **Interactive Queries** on `:7020` (key-routed across pods; 503 until RUNNING). In `authoritative` mode it also writes the `nba:snapshot`/`nba:eligibility` Redis mirrors so downstream is byte-for-byte unaffected.
+
+**Modes / config.** `NBA_DECISION_ENGINE_MODE=shadow|authoritative` (default `shadow` — writes `.shadow` siblings, drives nothing; `authoritative` writes the real topics + Redis mirrors and becomes the writer when the master switch `NBA_DECISION_ENGINE=kstreams` flips). `NBA_OFFSET_RESET=earliest` (rebuild every member's snapshot into state, parity with snapshot-builder; `latest` for the live-edge shadow latency test). Plus `NBA_ENGINE_ADVERTISED` (IQ host:port), `NBA_COMMIT_INTERVAL_MS=100`, `NBA_STANDBY_REPLICAS=1`.
+
+---
+
+## Flink Engine (Flink reference impl)
+
+`nba/services/nba-flink-engine/.../NbaFlinkApp.java` · container `ais-nba-flink-engine` · boot wave 16
+
+**Purpose.** The WHOLE NBA spine as ONE Apache Flink DataStream job — REPLACING the five bespoke services (snapshot-builder, rules-engine, journey-scorer, action-router) **and Temporal** (the per-action lifecycle becomes a `KeyedProcessFunction` with timers). Third reference impl alongside the classic Redis spine and the Kafka Streams engine; Kafka topics are the connective tissue (same topics, same flow), so it's a drop-in-shaped port. Runs embedded via a local MiniCluster (one container); checkpointed for exactly-once state.
+
+**I/O.** Six layers as Flink operators: SNAPSHOT (`member.facts`→`nba.snapshots`) · RULES (`nba.snapshots` + broadcast `nba.definitions`→`nba.evaluations`) · SCORE (`nba.evaluations`→`kind=score`) · ROUTE (`nba.evaluations`→`kind=router`) · STATE MACHINE (`member.facts` router/disposition→`nba.actionstate.*` + `nba.activations`) · ACT LAYER (`nba.activations`→`kind=disposition`). DLQ `nba.dlq.flink-engine`.
+
+**Modes / config.** `NBA_FLINK_MODE=shadow|authoritative` (default `shadow` — `.shadow` sinks, no Redis write-through, drives nothing; `authoritative` writes the real topics + Redis mirrors). `NBA_FLINK_PARALLELISM=1`. Also `NBA_FLINK_CHECKPOINT_MS=10000`, plus the lifecycle knobs it absorbs from Temporal/action-layer (`NBA_DEBOUNCE_SECONDS`, `NBA_DISPOSITION_STEP_MS`, `NBA_HARD_FRACTION`, …).
 
 ---
 
@@ -100,7 +126,7 @@ transparent heuristic, never a learned model. Output keying/replay-safety semant
 
 `nba/services/nba-temporal/...` · container `ais-nba-temporal-worker` · boot wave 20 · server `ais-nba-temporal:7233`
 
-Full spec in [03-state-machine.md](03-state-machine.md). Summary: one `ChannelActionWorkflow` per `nba-ca:{nbaId}:{actionId}:{channel}`; 11 states; debounce sibling-dedup (tristate LOSE/WAIT/PROCEED); in-process `ThrottleGate` (SEND/WAIT/SUPPRESS); emits via Postgres **outbox** (`outbox_member_facts`→`nba.member.facts`, `outbox_activations`→`nba.activations`) tailed by Debezium. Three Kafka threads: bridge (`kind=router`), disposition consumer (`kind=disposition|completion`, routes by `trackingId`), throttle-feed (`nba.definitions`, broadcast). Workflow reuse policy `ALLOW_DUPLICATE` + conflict `USE_EXISTING` (repeated CREATE attaches to the running workflow). DLQs `nba.dlq.temporal-disposition`, `nba.dlq.temporal-bridge`.
+Full spec in [03-state-machine.md](03-state-machine.md). Summary: one `ChannelActionWorkflow` per `nba-ca:{nbaId}:{actionId}:{channel}`; 11 states; debounce sibling-dedup (tristate LOSE/WAIT/PROCEED); in-process `ThrottleGate` (SEND/WAIT/SUPPRESS); emits via Postgres **outbox** (`outbox_member_facts`→`nba.member.facts`, `outbox_activations`→`nba.activations`) tailed by Debezium. Three Kafka threads: bridge (`kind=router`), disposition consumer (`kind=disposition|completion`, routes by `trackingId`), throttle-feed (`nba.definitions`, broadcast). Workflow reuse policy `ALLOW_DUPLICATE` + conflict `USE_EXISTING` (repeated CREATE attaches to the running workflow). DLQs `nba.dlq.temporal-disposition`, `nba.dlq.temporal-bridge`. **Config:** `NBA_DEBOUNCE_SECONDS=60` (settle window) + `NBA_BRIDGE_CONCURRENCY=1` (parallel workflow starts off the bridge; `1` = legacy serial).
 
 **Per-channel touch-template escalation** (`ActionActivitiesImpl`). A channel in the catalog `channels[]` can carry `touchKeys = [firstTouch, secondTouch, thirdTouch]` template ids. A MONOTONIC per-`(member, channel)` counter — table `channel_touch (nba_id text, channel text, n bigint, PRIMARY KEY (nba_id, channel))` in the actionlib Postgres, created `IF NOT EXISTS` by the worker on startup — is bumped at the SINGLE dispatch send point (`emitActivation` single-action and `emitBatchDispatch` batch, on a real `DISPATCH` only), AFTER debounce/suppress/throttle have settled, so debounced/suppressed/throttled attempts NEVER escalate. The bump is an atomic `INSERT … ON CONFLICT (nba_id, channel) DO UPDATE SET n = channel_touch.n + 1 RETURNING n` (race-free for concurrent batch sends); it NEVER resets. The send overrides the variant-selected `contentKey` with `touchKeys[min(n, len) - 1]` (caps at the last configured); absent `touchKeys` → the `contentKey` is used unchanged. The count is per-CHANNEL regardless of action — any prior send on a touch-configured channel (of ANY action) counts toward the next action's touch number, which is exactly why the counter lives in the send activity, not a per-`(member, action, channel)` workflow. `emitActivation` also now carries `entityId`/`nbaId` on every single-action DISPATCH (not just batches), so single sends land attributed in `silver_activations` for journey reconstruction / RL training.
 
@@ -163,6 +189,30 @@ Full spec in [03-state-machine.md](03-state-machine.md). Summary: one `ChannelAc
 
 ---
 
+## Journey Scorer (Databricks-free async scorer)
+
+`nba/services/nba-journey-scorer/scorer.py` · container `ais-nba-journey-scorer` · **Python** · boot wave 17
+
+**Purpose.** A Databricks-free drop-in for the dbx RL scorer so the whole flywheel scores + completes locally with Databricks parked. The score is a DETERMINISTIC scripted-journey function of the member's state (no model, no tunnel): FRESH/un-attempted actions score highest (spread per-`(member,action,channel)` for varied journeys), in-flight sink, soft-completed/negative deprioritize, hard-completed sink to the bottom — so the router's argmax walks each member forward through their funnel. Test/dev only — NOT the production RL policy.
+
+**I/O.** In: `nba.evaluations` (group `nba-journey-scorer`; skips `type=score` re-emits — the loop-break). Out: `nba.score.{actionId}.{channel}` facts onto `nba.member.facts` (`kind=score`, keyed by member), exactly like the dbx job. No Redis.
+
+**Config.** `NBA_OFFSET_RESET=latest` (run.ps1).
+
+---
+
+## Conversion Sim (Databricks-free outbound completion sim)
+
+`nba/services/nba-conversion-sim/sim.py` · container `ais-nba-conversion-sim` · **Python** · boot wave 18
+
+**Purpose.** The local analog of the Databricks source-sim's conversions. Watches DELIVERED outbound actions and finishes the GOAL for a deterministic fraction of `(member, action)` pairs so outbound members reach HARD_COMPLETED locally instead of only EXPIRING (the rest expire = the negative RL label). With the journey scorer it closes the whole local loop (eligible→score→route→dispatch→convert|expire→recirculate) with Databricks parked.
+
+**I/O.** In: `nba.member.facts` (`kind=state`) — watches `nba.actionstate.{aid}.{ch}` reaching `PRESENTED`/`IN_PROCESS`/`SOFT_COMPLETED`. Out: HTTP `POST {NBA_ACTION_LIBRARY}/completion` (→ outbox `nba.completion.{aid}`) for the converting fraction. Convert/no-convert is a stable hash of `(member, action)` (decides once, reproducible). No Kafka producer.
+
+**Config.** `HARD_FRACTION=0.4` (share that convert), `NBA_ACTION_LIBRARY=http://nba-action-library:7001`, `NBA_OFFSET_RESET=latest` (run.ps1).
+
+---
+
 ## Inbound Member Simulator
 
 `nba/services/nba-inbound-sim/inbound_sim.py` · container `nba-inbound-sim` · image `localhost/ais-nba-inbound-sim` · network `aiservices_default` · **Python** (not a Java jar)
@@ -183,12 +233,10 @@ Full spec in [03-state-machine.md](03-state-machine.md). Summary: one `ChannelAc
 
 | Key | Type | Writer | Reader | Contents |
 |-----|------|--------|--------|----------|
-| `nba:idmap:{type}:{id}` | string | snapshot-builder, ml-scorer | action-library | nbaId (SETNX, permanent) |
+| `nba:idmap:{type}:{id}` | string | snapshot-builder | action-library | nbaId (SETNX, permanent) |
 | `nba:snapshot:{nbaId}` | hash | snapshot-builder (MULTI/EXEC, authoritative), action-library (hot-path write-through, best-effort) | snapshot-builder (LWW/prune/re-emit), action-library (hot path), action-layer (sim features) | `fact:{key}`→fv JSON + `__entityType/__entityId/__nbaId/__updatedTs`. (rules-engine reads snapshots off the `nba.snapshots` Kafka topic, not this key.) |
 | `nba:eligibility:{nbaId}` | string | action-router (authoritative, off the eval), action-library (hot-path score write-through, best-effort) | action-library (cached serve + hot path), rules-engine (change detection) | the single eligibility object (`channelActions[]` + perpetual `completed[]`/`milestones[]`; transient `newCompleted`/`newMilestones` stripped before persist) |
 | `nba:eval:eligsig/fullsig:{nbaId}` | string | rules-engine | rules-engine | change-dedup identities |
-| `nba:milestones:{nbaId}` | hash | rules-engine (HSETNX) | rules-engine | permanent milestone latches |
-| `nba:completed:{nbaId}` | hash | rules-engine (HSETNX) | rules-engine | permanent hard-completion latches |
 | `nba:rulefacts` | set | action-library | snapshot-builder | fact keys any rule references (lean filter) |
 | `nba:suppressed` | set | action-library | router, action-library | suppressed action/channel targets |
 | `nba:channel:maxbatch` | hash | action-library | action-router | per-channel batch size |
@@ -198,8 +246,8 @@ Full spec in [03-state-machine.md](03-state-machine.md). Summary: one `ChannelAc
 | DLQ | Source topic | Consumer |
 |-----|--------------|----------|
 | `nba.dlq.snapshot-builder` | `nba.member.facts` | snapshot-builder |
-| `nba.dlq.ml-scorer-features` | `nba.facts` | ml-scorer feature store |
-| `nba.dlq.ml-scorer-scorer` | `nba.evaluations` | ml-scorer |
+| ~~`nba.dlq.ml-scorer-features`~~ | `nba.facts` | **RETIRED** (ml-scorer) |
+| ~~`nba.dlq.ml-scorer-scorer`~~ | `nba.evaluations` | **RETIRED** (ml-scorer) |
 | `nba.dlq.action-router` | `nba.evaluations` | action-router |
 | `nba.dlq.action-layer` | `nba.activations` | action-layer |
 | `nba.dlq.temporal-disposition` | `nba.member.facts` | temporal disposition consumer |
