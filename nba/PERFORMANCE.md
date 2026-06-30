@@ -123,9 +123,23 @@ A `infra/run-loadtests.sh` re-run on the dev box reaffirmed the profile above:
   had the whole disk. **Raised Redis to 8 GB** (`run-nba-redis.ps1`) and re-measured: the isolated classic snapshot
   drains at **~1,950/s** and Redis held the 150k-member working set in **~120 MB with no OOM**. The wall now sits at
   ~1.7M members — architectural (Redis is RAM-bounded), but a fair ceiling rather than a 256 MB artifact.
+- **The shared scorer is the real throughput floor — and it's an I/O artifact, not compute.** The local
+  journey-scorer (the Databricks-free heuristic: md5 + arithmetic bands, **no numpy**) drains `nba.evaluations` at
+  only **~618/s** isolated. The cause is one line: it `producer.flush()`es **every eval** — a synchronous Kafka ack
+  round-trip (~1.6 ms) that blocks the loop, so records never batch across evals. The scoring itself is microseconds.
+  Two fixes, both measured here:
+  - **Batch the produce** (`linger_ms` + drop the per-eval flush) → **~7,011/s on a single instance — 11×** — a
+    one-line change. One batched instance beats four un-batched instances (1,510/s, contended box) by ~4.6×.
+  - **Scale out** (Kafka consumer group, capped by partition count): 1 → 4 instances = 618 → ~1,510/s on this single
+    box (sub-linear from CPU/broker contention; near-linear on real infra with more partitions/nodes).
+  This is **cross-flavor**: classic / KStreams / Flink all route the *scored* decision through the SAME shared scorer
+  (prod = the Databricks RL scorer), so an engine's compute speed (Flink rules ~20k/s) is moot for the scored path
+  until the scorer keeps up. Scored-decision scale is a **scorer** problem — batch it first, then shard it.
 
 **Bottom line — the FAIR comparison.** Per-instance write throughput is **classic ~2k/s (Redis HSET network
 round-trip) < KStreams ~7k/s (local RocksDB) < Flink ~20k/s (heap)** — that gap is the *state medium*, not a memory
 cap. Raising Redis memory removes the unfair early OOM but does **not** change classic's per-instance speed (it's
-the network round-trip). The real bounds remain the state store (Redis RAM-bounded at a fair ~1.7M members vs
-disk-backed engines with no wall) and the Temporal start path (§3–§5).
+the network round-trip). The real bounds, in priority order: the **shared scorer** (~618/s as written → ~7k/s
+batched → then shardable — the tightest bound but the cheapest to fix), the **state store** (Redis RAM-bounded at a
+fair ~1.7M members vs disk-backed engines with no wall), and the **Temporal start path** (§3–§5). The compute stages
+(snapshot / rules / router) are **not** the bottleneck on any flavor.
