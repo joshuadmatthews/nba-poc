@@ -143,3 +143,44 @@ the network round-trip). The real bounds, in priority order: the **shared scorer
 batched → then shardable — the tightest bound but the cheapest to fix), the **state store** (Redis RAM-bounded at a
 fair ~1.7M members vs disk-backed engines with no wall), and the **Temporal start path** (§3–§5). The compute stages
 (snapshot / rules / router) are **not** the bottleneck on any flavor.
+
+**End-to-end check (scorer batched, full spine).** Swapping the batched scorer into the live pipeline and driving
+300k members confirmed the cascade: with the scorer no longer throttling, the **snapshot-builder's backlog explodes
+(+~9k/s) while every other stage stays near zero** — the fast scorer *floods* `member.facts` with scores faster than
+one snapshot-builder can `HSET` them. So the real per-lane limit is the **snapshot-builder's Redis write**, and it
+can't be fixed by speeding up a single stage (that just dumps load downstream) — it needs partitioned lanes + a
+write tier that scales (§5). Note the snapshot-builder already batches Redis (pipelined reads + one `MULTI` for the
+writes — ~2 round-trips per *batch*, not per record), and `redis-benchmark` does ~82k HSET/s, so the ~1,950/s is the
+**per-batch EOS commit + the single-partition design**, not Redis saturating. It is explicitly built to scale out
+(`transactional.id … unique across instances when scaling out`): partition `member.facts` → N snapshot-builders → N
+lanes.
+
+---
+
+## 7. Cloud Redis — Azure Cache for Redis vs Azure Managed Redis
+
+The §3 RAM wall and the §5 "shard Redis to keep scale-out linear" conclusions point straight at the cloud Redis
+choice. *(Tiers, limits, and retirement dates below are as of early 2026 — verify against current Azure docs.)*
+
+**The core difference.** *Azure Cache for Redis* (the OSS-based Basic/Standard/Premium tiers, on a retirement path)
+is **open-source Redis — single-threaded per shard**. *Azure Managed Redis* (the go-forward, built on the **Redis
+Enterprise** stack) is **multi-threaded per node** — many shards/proxies across all cores, transparently. That one
+fact drives the comparison against our three limits:
+
+| our limit | Azure Cache for Redis (OSS tiers) | Azure Managed Redis (Enterprise) |
+|---|---|---|
+| **write throughput** (the snapshot `HSET` lane) | single-thread **per shard** → aggregate = shards × one core; high write QPS needs *many* shards | **multi-threaded per node** → far higher per-node writes → fewer nodes/shards for the same aggregate |
+| **RAM wall** (§3/§6) | pure-RAM (Premium ~120 GB/instance); SSD tiering only on the separate *Enterprise Flash* tier | **Flash Optimized** tier = NVMe SSD tiering, hot data in RAM → large member-state at much lower $/GB — directly mitigates the RAM wall |
+| **sharding** (partition by member) | **OSS Redis Cluster** — the *client* must be cluster-aware (our `JedisPooled` → `JedisCluster`), hash-slot routing, cross-slot ops restricted | **transparent clustering** — single endpoint (or OSS-cluster API), shards handled internally; shard-by-`nbaId` is simpler |
+
+Plus Managed Redis adds active-active geo-replication (CRDTs), the modules (Search / JSON / …) included, and
+generally better price/performance.
+
+**For this system** Managed Redis is the better fit *and* the surviving product. Our bottleneck is the per-lane Redis
+write, and the fix is "more lanes + shard Redis" (§5). On the OSS tiers that means many **single-threaded shards**
+plus a cluster-aware client; on Managed Redis a **multi-threaded node absorbs many lanes before you even shard** —
+same throughput, fewer Redis nodes, simpler client code. And the RAM wall we measured (§3/§6) is answered by the
+platform via **flash tiering** (spill cold member-state to SSD) instead of buying ever-larger RAM nodes — exactly the
+"TTL'd to hot members" idea in §5, solved by the tier. Migration note: had we run on OSS Premium clustering, the
+snapshot-builder's `JedisPooled` would need cluster-awareness — moving to Managed Redis's single transparent endpoint
+*avoids* that, so it's a simplification, not a port.
