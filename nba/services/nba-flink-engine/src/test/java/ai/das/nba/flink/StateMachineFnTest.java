@@ -177,4 +177,49 @@ class StateMachineFnTest {
         assertEquals(N, countState(h, "SUPPRESSED"), "every cancelled action terminates SUPPRESSED");
         h.close();
     }
+
+    /** The PRODUCER path: the existing `POST /suppress` publishes an ACTION_SUPPRESS:{target} flag to nba.definitions;
+     *  on its false->true transition the broadcast handler fans the fleet cancel (no separate producer needed). */
+    static FactRecord actionSuppress(String actionId, String channel, boolean on) {
+        String target = (channel == null || channel.isEmpty()) ? actionId : actionId + "." + channel;
+        String v = "{\"entityType\":\"SYSTEM\",\"entityId\":\"__action\",\"key\":\"nba.actionsuppress." + target
+                + "\",\"value\":" + on + ",\"valueType\":\"BOOL\",\"actionId\":\"" + actionId + "\",\"channel\":\""
+                + (channel == null ? "" : channel) + "\",\"eventTs\":1,\"source\":\"operator\"}";
+        return new FactRecord("ACTION_SUPPRESS:" + target, v, "action-suppress", 1L);
+    }
+
+    @Test void actionSuppressFlagFansFleetCancelOnTransitionOnly() throws Exception {
+        var h = smHarness(300);
+        h.processElement(new StateEvent("nbaA:act1:email", "CREATE", createFact("nbaA", "mA", "act1", "email")), 1L);
+        h.processElement(new StateEvent("nbaB:act1:email", "CREATE", createFact("nbaB", "mB", "act1", "email")), 2L);
+        h.processBroadcastElement(actionSuppress("act1", "", true), 3L);
+        assertEquals(2, countState(h, "SUPPRESSED"), "ACTION_SUPPRESS=true (the existing /suppress producer) fans a fleet cancel");
+        h.processBroadcastElement(actionSuppress("act1", "", true), 4L);   // redelivered, not a transition
+        assertEquals(2, countState(h, "SUPPRESSED"), "a redelivered true flag does NOT re-fire — only the false->true transition does");
+        h.close();
+    }
+
+    /** Fan-out micro-benchmark: build N in-process (TRACKING) instances, then time ONLY the single broadcast fan-out
+     *  (the applyToKeyedState scan + per-key SUPPRESSING + CANCEL build; Kafka I/O is async downstream, excluded).
+     *  Default N is small so the suite stays fast; run the real measurement with -DbenchScan=true (10k/100k/500k) or
+     *  -DbenchN=&lt;n&gt;. Heap state backend = the engine's production config, so the ns/key is representative. */
+    @Test void fanoutBenchmark() throws Exception {
+        int[] scan = "true".equals(System.getProperty("benchScan"))
+                ? new int[]{10_000, 100_000, 500_000}
+                : new int[]{ Integer.getInteger("benchN", 4_000) };
+        for (int N : scan) {
+            var h = smHarness(1);
+            for (int i = 0; i < N; i++)
+                h.processElement(new StateEvent("nba" + i + ":act1:push", "CREATE", createFact("nba" + i, "m" + i, "act1", "push")), i + 1);
+            h.setProcessingTime(60_000L);                                  // dispatch all into TRACKING (the in-flight queue)
+            long t0 = System.nanoTime();
+            h.processBroadcastElement(opSuppress("act1", null), 70_000L);  // ONE broadcast cancels the whole queue
+            long ns = System.nanoTime() - t0;
+            assertEquals(N, countState(h, "SUPPRESSING"), "every in-process instance cancelled by ONE broadcast");
+            assertEquals(N, cancelCount(h), "and a CANCEL activation apiece");
+            System.out.printf("[fanout-bench] N=%,d  fanout=%.1f ms  %.0f ns/key  (heap backend, emit-build incl, kafka excl)%n",
+                    N, ns / 1e6, (double) ns / N);
+            h.close();
+        }
+    }
 }

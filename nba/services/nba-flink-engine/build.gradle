@@ -40,7 +40,11 @@ dependencies {
 
 application { mainClass = 'ai.das.nba.flink.NbaFlinkApp' }
 java { toolchain { languageVersion = JavaLanguageVersion.of(17) } }   // Flink 1.18 supports Java 17
-test { useJUnitPlatform() }
+test {
+    useJUnitPlatform()
+    ['benchN', 'benchScan'].each { k -> if (System.getProperty(k) != null) systemProperty(k, System.getProperty(k)) }
+    if (System.getProperty('benchScan') != null || System.getProperty('benchN') != null) maxHeapSize = '12g'   // big-N fan-out bench
+}
 
 // Flink + Drools both rely on ServiceLoader + typesafe-config reference.conf; merge/append them in the fat jar
 // or the embedded MiniCluster (Pekko RPC) and the Drools KieServices fail to bootstrap.

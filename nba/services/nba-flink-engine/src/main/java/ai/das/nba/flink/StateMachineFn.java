@@ -64,11 +64,20 @@ public class StateMachineFn extends KeyedBroadcastProcessFunction<String, StateE
         if (def.key == null) return;
         int i = def.key.indexOf(':');
         String type = i < 0 ? def.key : def.key.substring(0, i);
-        // Fleet-wide operator suppress: a single broadcast command, fanned out across ALL matching keyed instances
-        // (the suppressMatching analog). One-shot command, so it is NOT stored in the definitions broadcast state.
-        if ("OPSUPPRESS".equals(type)) { fleetSuppress(def.value, ctx, out); return; }
+        // Explicit one-shot fleet-suppress command (value = {"actionId","channel"?}); NOT stored in broadcast state.
+        if ("OPSUPPRESS".equals(type)) { fleetSuppress(suppressTarget(def.value), ctx, out); return; }
         var st = ctx.getBroadcastState(DEFS_DESC);
         if (def.value == null || def.value.isEmpty()) { st.remove(def.key); return; }
+        // ACTION_SUPPRESS:{target} is the operator's PERSISTENT suppressed-flag, published by the existing
+        // POST /suppress (the same producer that drives classic's eligibility + SuppressionWorkflow). On the
+        // false->true TRANSITION, ALSO fan a fleet cancel across the in-flight instances — so the existing operator
+        // action drives the Flink in-flight fan-out too. Compacted redeliveries (same value) don't re-fire.
+        if ("ACTION_SUPPRESS".equals(type)) {
+            boolean prevOn = onFlag(st.get(def.key)), curOn = onFlag(def.value);
+            st.put(def.key, def.value);
+            if (curOn && !prevOn) fleetSuppress(suppressTarget(def.value), ctx, out);
+            return;
+        }
         st.put(def.key, def.value);
         if (i < 0) return;
         String id = def.key.substring(i + 1);
@@ -79,21 +88,29 @@ public class StateMachineFn extends KeyedBroadcastProcessFunction<String, StateE
         } catch (Exception ignore) { /* skip bad def */ }
     }
 
+    /** Parse {actionId, channel} out of a command/flag value -> [actionId, channel] ("" channel = all channels). */
+    private static String[] suppressTarget(String json) {
+        try { JsonNode v = SnapshotLogic.M.readTree(json);
+              return new String[]{ v.path("actionId").asText(""), v.path("channel").asText("") }; }
+        catch (Exception e) { return new String[]{"", ""}; }
+    }
+
+    /** The boolean "value" of an ACTION_SUPPRESS flag fact (false when absent/unparseable). */
+    private static boolean onFlag(String json) {
+        if (json == null || json.isEmpty()) return false;
+        try { return SnapshotLogic.M.readTree(json).path("value").asBoolean(false); } catch (Exception e) { return false; }
+    }
+
     /** Fan ONE operator-suppress command across every matching LIVE keyed instance via {@code applyToKeyedState} —
      *  the Flink analog of Temporal's suppressMatching Batch Operation, but a local memory-speed keyed-state scan
      *  instead of O(N) durable per-workflow signals. The per-key transition mirrors the OPERATOR_SUPPRESS branch in
      *  {@link #processElement} exactly: pre-send (DEBOUNCE/THROTTLE) instances go terminal SUPPRESSED; post-send
      *  (TRACKING) instances emit SUPPRESSING + a CANCEL activation (the activation layer then replies with a
      *  SUPPRESSED/SUPPRESS_FAILED disposition, just like the per-key path). Idempotent — already terminal/cleared
-     *  keys are skipped, so re-broadcasting the same command emits nothing new. value = {"actionId", "channel"?}
-     *  (empty/absent channel = all channels for the action). */
-    private void fleetSuppress(String value, Context ctx, Collector<KafkaOut> out) throws Exception {
-        final String actionId, channel;
-        try {
-            JsonNode v = SnapshotLogic.M.readTree(value);
-            actionId = v.path("actionId").asText("");
-            channel  = v.path("channel").asText("");
-        } catch (Exception e) { return; }
+     *  keys are skipped, so re-broadcasting the same command emits nothing new. target = [actionId, channel]
+     *  (empty channel = all channels for the action). */
+    private void fleetSuppress(String[] target, Context ctx, Collector<KafkaOut> out) throws Exception {
+        final String actionId = target[0], channel = target[1];
         if (actionId.isEmpty()) return;
         final long now = ctx.currentProcessingTime();
         final java.util.List<KafkaOut> facts = new java.util.ArrayList<>();

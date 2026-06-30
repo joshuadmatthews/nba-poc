@@ -247,15 +247,14 @@ Temporal and a keyed-stream job have genuinely different properties for stateful
   Flink's keyed-state model makes the same fan-out **naturally cheap**: broadcast *one* control record and apply it to
   every matching keyed entry locally (`applyToKeyedState` over the broadcast that already feeds the ThrottleGate) —
   memory-speed in each operator, no per-entity round-trip, durability folded into the next checkpoint (one write for
-  all keys). *Status — now real, not just latent:* the broadcast fan-out is **implemented and tested** in the engine.
-  `StateMachineFn` handles an `OPSUPPRESS` broadcast command and applies it across every matching keyed instance via
-  `applyToKeyedState` (pre-send → terminal `SUPPRESSED`; post-send → `SUPPRESSING` + a `CANCEL` activation, then the
-  layer's disposition drains it — the same cascade as the per-key path). Harness tests cover the fan-out, action- and
-  channel-scoping, idempotency, and a **1,000-action in-process queue cancelled by one broadcast and drained to
-  `SUPPRESSED`**. What's still unwired is only the *producer* — an operator action publishing the `OPSUPPRESS` record
-  onto the definitions stream (classic already has `suppressMatching`). So it's a real engine capability behind a thin
-  operator-API gap, not a paper one: bulk mutation is where the data-parallel stream model structurally beats
-  per-workflow actors.
+  all keys). *Status — wired end-to-end, tested, and measured:* `StateMachineFn` fans the cancel across every matching
+  keyed instance via `applyToKeyedState` (pre-send → terminal `SUPPRESSED`; post-send → `SUPPRESSING` + a `CANCEL`
+  activation, then the layer's disposition drains it — the same cascade as the per-key path), driven by the **existing**
+  `POST /suppress` producer (its `ACTION_SUPPRESS` flag on `nba.definitions`, on the `false→true` transition; an explicit
+  `OPSUPPRESS` command works too). Harness tests cover the fan-out, the producer-flag path, action/channel scoping,
+  idempotency, and a **1,000-action in-process queue cancelled by one broadcast and drained to `SUPPRESSED`**. Measured
+  (next subsection): a **1M-instance fan-out in ~4.7 s vs ~1.6 h** of Temporal Batch-Operation signals. Bulk mutation is
+  where the data-parallel stream model structurally beats per-workflow actors.
 - **Recovery scope (poison is already handled).** Poison records do **not** stall the job — Flink dead-letters them:
   `ClassifyResolveFn` routes unparseable records to a **DLQ side-output** (`DLQ_TAG` → `nba.dlq`, like the classic
   builder), and the other operators guard with try/catch. The real difference is *recovery scope*: a genuine job
@@ -285,6 +284,38 @@ single-instance tooling** (inspect / reset / terminate one arbitrary workflow + 
 For a high-throughput, mostly-automated decision loop that's a good trade; where you need rich single-instance
 debug/intervention or very-long human-in-the-loop waits, Temporal still earns its keep.
 
+### Bulk suppress, measured — one broadcast vs N durable signals
+The bulk-control asymmetry above is now **wired end-to-end and measured**. Producer: the existing `POST /suppress`
+already publishes the `ACTION_SUPPRESS:{target}` flag to `nba.definitions`; the Flink state machine broadcasts that
+topic in, and on the flag's `false→true` transition `StateMachineFn` fans a fleet-cancel across every matching keyed
+instance via `applyToKeyedState` (pre-send → `SUPPRESSED`; in-flight → `SUPPRESSING` + a `CANCEL` activation). No new
+producer — the same operator action drives both engines. Classic does the same fan-out with a server-side Temporal
+**Batch Operation** (`suppressMatching`: a `NbaActionId='X' AND ExecutionStatus='Running'` Visibility query → signal
+`operatorSuppress`).
+
+**Measured Flink fan-out** (operator test harness, **heap state backend = the engine's prod config**, single
+sub-task, single thread; each key builds its `SUPPRESSING` fact + `CANCEL` activation JSON — the work *both* engines
+do — and *excludes* the async Kafka production of those events, which is pipelined downstream off the fan-out path):
+
+| in-flight instances | Flink fan-out (measured) | Temporal Batch Op @ the measured ~178/s server bound (§3) |
+|---|--:|--:|
+| 10,000 | **0.11 s** | ~56 s |
+| 100,000 | **0.80 s** | ~9.4 min |
+| 1,000,000 | **4.7 s** | ~1.6 h |
+
+The Flink scan is linear (~5–11 µs/key across the range; JIT/GC variance, ~100–200k keys/s). The Temporal column is
+**computed from the previously-measured ~178/s single-node server bound** (§3), used as a *generous* proxy for the
+Batch Operation's per-workflow signal rate — each signal is a durable history append + workflow task + persist, the
+same class of server-bound durable op, and real Batch-Operation RPS is often throttled *below* this. So the ~10³×
+gap **favors Temporal in the framing** and is still three-plus orders of magnitude. Both scale horizontally (Temporal:
+more history shards/nodes; Flink: more parallel sub-tasks, each fanning out its key-partition), so the asymmetry —
+in-memory keyed-state scan vs N durable signals — holds at equal parallelism.
+
+*Grounding (live):* the running classic stack currently holds **71,172 in-flight `ChannelActionWorkflow`s**
+(~6–7k per action-channel). Suppressing one action across its channels (`action_reengage`, ≈24.7k running) projects
+to **~140 s on Temporal vs ~0.15 s on Flink**. A live stopwatch run (which cancels that slice's in-flight workflows)
+is available on request rather than run unprompted.
+
 ### KStreams, assuming Redis stays the hot path — what it actually buys
 Keep **Redis as the hot-path read cache** (its real strength, §2) and KStreams' own read surface (IQ) goes unused —
 fine, since IQ is fragile under load (§2). So KStreams' *only* remaining contribution is on the **write/state side**:
@@ -304,7 +335,7 @@ economical Redis RAM.
 | **state-machine dynamic state** | Temporal + **Postgres** (`channel_touch` / `nba_inflight`) | Temporal + Postgres (unchanged) | **in-stream keyed state** (no Temporal, no per-dispatch Postgres) |
 | **reliable publish to Kafka** | outbox → **Debezium** CDC | outbox → Debezium (unchanged) | **direct EOS Kafka sink** (no outbox/CDC) |
 | **single-instance ops** | Temporal: query / **reset / terminate any one workflow** + history UI | Temporal (unchanged) | domain **cancel (suppress) ✓**; no out-of-band reset/terminate or per-key history UI |
-| **bulk / fleet-wide suppress** | Batch Operation — O(N) **durable** signals (server-throttled) | Temporal (unchanged) | **broadcast → keyed-state fan-out** (memory-speed; engine done + tested, producer-API unwired) |
+| **bulk / fleet-wide suppress** | Batch Operation — O(N) **durable** signals (~1.6 h / 1M @ measured bound) | Temporal (unchanged) | **broadcast → keyed-state fan-out** (wired via `POST /suppress`; measured **~4.7 s / 1M**) |
 | **RAM wall on the source of truth** | yes (Redis-bound) | **no** (RocksDB) | **no** (disk/heap) |
 | **hot-path reads** | **Redis (fast, always-up)** | Redis (IQ unused) | needs Redis write-through |
 | **earns its complexity for** | nothing — it's the simple default | member-state > economical RAM, Redis kept | **dispatch burst + operational consolidation + RAM wall** |
