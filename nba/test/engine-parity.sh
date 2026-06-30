@@ -29,7 +29,7 @@ freshshadow(){ for t in member.facts snapshots evaluations activations facts; do
 
 # consume a snapshots/evaluations topic ONCE -> "nbaId<TAB>normalized" per member (latest), into $2
 dump_snaps(){ local h; h=$(hwm "$1"); { [ -z "$h" ] || [ "$h" -le 0 ]; } && { :>"$2"; return; }
-  podman exec $P rpk topic consume "$1" -o start -n "$h" -f '%v\n' 2>/dev/null | python -c "
+  podman exec $P rpk topic consume "$1" -o start -n "$h" -f '%v\n' 2>/dev/null | cat | python -c "
 import sys,json
 L={}
 for line in sys.stdin:
@@ -40,7 +40,7 @@ for line in sys.stdin:
     L[nid]=';'.join(sorted(f'{k}={(v.get(chr(118)+chr(97)+chr(108)+chr(117)+chr(101)) if isinstance(v,dict) else v)}' for k,v in d.get('facts',{}).items()))
 for k,v in L.items(): print(k+'\t'+v)" > "$2"; }
 dump_evals(){ local h; h=$(hwm "$1"); { [ -z "$h" ] || [ "$h" -le 0 ]; } && { :>"$2"; return; }
-  podman exec $P rpk topic consume "$1" -o start -n "$h" -f '%v\n' 2>/dev/null | python -c "
+  podman exec $P rpk topic consume "$1" -o start -n "$h" -f '%v\n' 2>/dev/null | cat | python -c "
 import sys,json
 L={}
 for line in sys.stdin:
@@ -77,6 +77,9 @@ start_flink(){ podman rm -f ais-nba-flink-engine >/dev/null 2>&1
     localhost/nba-flink-engine:latest >/dev/null
   for i in $(seq 1 30); do podman logs --tail 4 ais-nba-flink-engine 2>&1 | grep -q 'to RUNNING' && break; sleep 2; done; sleep 4; }
 
+# Reset to a fresh baseline first (small topics = fast consumes, no residue/old-journey carry-over). Skip with
+# NBA_TEST_NO_RESET=1 if the stack is already clean.
+if [ "${NBA_TEST_NO_RESET:-0}" != "1" ]; then bash "$(dirname "$0")/reset-fresh.sh" || exit 1; fi
 echo "=== fresh .shadow topics + start Flink (shadow) before seeding ==="; freshshadow; start_flink
 echo "=== seed $N deterministic members ==="
 NBA_SEED_TOPIC=nba.member.facts python nba/infra/reseed-members-local.py "$N" 2>&1 | tail -1

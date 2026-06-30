@@ -26,16 +26,24 @@ evaluations. Boot order is the `ais.boot.wave=N` labels (15 infra → 16 → …
 
 ## Run the tests
 ```bash
-bash nba/test/nba-tests.sh          # integration suite (drives the live stack, asserts at each layer)
+bash nba/test/reset-fresh.sh        # reset stack to a clean baseline (topics/offsets/DLQs/Redis + re-seed defs)
+bash nba/test/nba-tests.sh          # integration suite -- runs reset-fresh FIRST, then asserts at each layer
 bash nba/test/nba-tests.sh fast     # skip the slow Temporal-lifecycle tests
 bash nba/test/engine-parity.sh      # cross-engine shadow-diff DIAGNOSTIC (see its header: a live diff measures a
                                     # journey-timing race, not logic equiv; rigorous equiv = golden-fixture unit tests)
 bash nba/infra/run-loadtests.sh     # per-stage throughput matrix (classic spine)
 bash nba/infra/run-loadtests.sh --engines   # also the Flink shadow rules stage
 ```
-Per-service unit tests run inside the image build (`gradle test shadowJar` gates each `run.ps1 -Build`).
-Tests use a fresh member id per run (no reset needed). Lifecycle tests need the temporal worker on a short
-debounce: `pwsh nba/services/nba-temporal/run.ps1 -DebounceSeconds 10`.
+- **Reset-fresh runs automatically.** `nba-tests.sh` / `engine-parity.sh` call `reset-fresh.sh` first, so a run
+  never depends on residue (a stale DLQ, an old in-flight journey, a bloated definitions topic, leaked offsets).
+  Set `NBA_TEST_NO_RESET=1` to skip it when iterating one test against an already-clean stack.
+- **Per-service unit tests** run inside the image build (`gradle test shadowJar` gates each `run.ps1 -Build`) --
+  e.g. the rules-engine score-TTL test. These need no stack.
+- **Lifecycle tests** (the `STATE MACHINE` block, skipped by `fast`) need the temporal worker on a short debounce:
+  `pwsh nba/services/nba-temporal/run.ps1 -DebounceSeconds 10`. Default is 60s (prod-like) -> they'd time out.
+- **Shell note (Windows):** run the `.sh` suite in **WSL/Linux or Git Bash**. Every `rpk topic consume ... | python`
+  is piped through `| cat |` because on Git Bash + Windows-python rpk's EOF doesn't reach python (it hangs); cat
+  relays a clean EOF and is a no-op on Linux. If you add an `rpk ... | python`, keep the `| cat |`.
 
 ## Debug the local infra
 ```bash

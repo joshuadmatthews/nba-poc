@@ -32,8 +32,11 @@ action_id(){ # name -> actionId
   local hwm
   hwm=$(podman exec ais-nba-redpanda rpk topic describe nba.definitions -p 2>/dev/null | awk '/^[0-9]/{print $6}')
   { [ -z "$hwm" ] || [ "$hwm" -le 0 ]; } && return
+  # `| cat |`: on Git Bash + Windows-python, rpk's stdout EOF does not reach python through the podman-exec pipe
+  # (python blocks on stdin forever); interposing cat relays a clean EOF. No-op on Linux/WSL. Required on EVERY
+  # `rpk topic consume ... | python` in this suite.
   podman exec ais-nba-redpanda rpk topic consume nba.definitions -o start -n "$hwm" -f '%k\t%v\n' 2>/dev/null \
-    | python -c "import json,sys
+    | cat | python -c "import json,sys
 name='$1'; out=''
 for line in sys.stdin:
     k,_,v=line.partition('\t')
@@ -161,6 +164,13 @@ chk(){ # desc  getter-cmd  expected  [timeout]
   echo "  FAIL  $desc  (expected [$exp] got [$got])"; FAIL=$((FAIL+1)); return 1
 }
 slugs(){ local IFS=$'\n'; printf '%s\n' "$@" | sort | paste -sd, -; }   # sorted csv
+
+# Reset to a FRESH baseline FIRST (topics / consumer offsets / DLQs / Redis, then re-seed defs) so a run never
+# depends on residue -- a stale DLQ, an old in-flight journey, a bloated definitions topic. Set NBA_TEST_NO_RESET=1
+# to skip (iterating one test against an already-clean stack).
+if [ "${NBA_TEST_NO_RESET:-0}" != "1" ]; then
+  bash "$(dirname "$0")/reset-fresh.sh" || { echo "reset-fresh FAILED -- aborting"; exit 1; }
+fi
 
 echo "== resolving fixtures =="
 REE="$(action_id 'Reengage Email'):email"
@@ -507,29 +517,41 @@ t_state_failed(){ local m="${RUN}fail"; echo "[state_failed] a FAILED delivery d
 # week) so it stays replayable; the replay re-produces the EXACT original to its SOURCE topic and idempotency
 # makes it safe. snapshot-builder is the cleanest probe: ANY unparseable record on nba.member.facts is DLQ'd
 # (no header filter), and a valid member fact is snapshotted normally.
-t_dlq_replay(){ local m="${RUN}dlq"; echo "[dlq_replay] poison record -> nba.dlq.snapshot-builder envelope; replay the ORIGINAL good fact -> snapshotted normally (no data loss)"
-  local POISON="__POISON_${RUN}_not-json"                            # a unique marker so we can find OUR envelope
-  # 1) produce an UNPARSEABLE record to the consumer's input topic (nba.member.facts). snapshot-builder's
-  #    M.readTree throws -> it envelopes the record onto nba.dlq.snapshot-builder (still inside the txn).
-  echo "$POISON" | podman exec -i ais-nba-redpanda rpk topic produce nba.member.facts -k "OPERATOR:$m:poison" >/dev/null 2>&1
-  # 2) assert a DLQ envelope landed, shaped {consumer,topic,partition,offset,key,value,headers,error,dlqTs}
-  #    with consumer=snapshot-builder, topic(source)=nba.member.facts, value=our raw poison.
-  chk "poison enveloped onto nba.dlq.snapshot-builder (consumer+source-topic+raw value)" \
-    "podman exec ais-nba-redpanda rpk topic consume nba.dlq.snapshot-builder -o start -e -f '%v\n' 2>/dev/null | python -c \"import json,sys
-ok='n'
+# Did OUR poison (marker $1) land on the snapshot-builder DLQ at/after offset $2? Offset-aware (reads only the
+# NEW records past $2) and COUNT-based (-n) because this rpk build has no -e/exit-at-end flag. Echoes y|n.
+dlq_has_poison(){ local marker="$1" base="$2" h n
+  h=$(podman exec ais-nba-redpanda rpk topic describe nba.dlq.snapshot-builder -p 2>/dev/null | awk '/^[0-9]/{print $6}'); h=${h:-0}
+  n=$(( h - base )); [ "$n" -le 0 ] && { echo n; return; }
+  podman exec ais-nba-redpanda rpk topic consume nba.dlq.snapshot-builder -o "$base" -n "$n" -f '%v\n' 2>/dev/null | cat | MARK="$marker" python -c "
+import json,sys,os
+mark=os.environ['MARK']; ok='n'
 for line in sys.stdin:
     line=line.strip()
     if not line: continue
     try: e=json.loads(line)
     except: continue
-    if e.get('value')=='$POISON' and e.get('consumer')=='snapshot-builder' and e.get('topic')=='nba.member.facts' \
-       and all(k in e for k in ('partition','offset','key','headers','error','dlqTs')): ok='y'
-print(ok)\"" "y" 25
+    if e.get('value')==mark and e.get('consumer')=='snapshot-builder' and e.get('topic')=='nba.member.facts' and all(k in e for k in ('partition','offset','key','headers','error','dlqTs')): ok='y'
+print(ok)"
+}
+t_dlq_replay(){ local m="${RUN}dlq"; echo "[dlq_replay] poison record -> nba.dlq.snapshot-builder envelope; replay the ORIGINAL good fact -> snapshotted normally (no data loss)"
+  local POISON="__POISON_${RUN}_not-json"                            # a unique marker so we can find OUR envelope
+  # 1) produce an UNPARSEABLE record to the consumer's input topic (nba.member.facts). snapshot-builder's
+  #    M.readTree throws -> it envelopes the record onto nba.dlq.snapshot-builder (still inside the txn).
+  #    Capture the DLQ high-watermark FIRST so we scan only records AFTER it (offset-aware: reliable even if a
+  #    prior run left the DLQ non-empty; reset-fresh empties it, but never trust that).
+  local dlqbase; dlqbase=$(podman exec ais-nba-redpanda rpk topic describe nba.dlq.snapshot-builder -p 2>/dev/null | awk '/^[0-9]/{print $6}'); dlqbase=${dlqbase:-0}
+  echo "$POISON" | podman exec -i ais-nba-redpanda rpk topic produce nba.member.facts -k "OPERATOR:$m:poison" >/dev/null 2>&1
+  # 2) assert a DLQ envelope landed (offset-aware: only records after dlqbase), shaped
+  #    {consumer,topic,partition,offset,key,value,headers,error,dlqTs} with consumer=snapshot-builder,
+  #    source topic=nba.member.facts, value=our raw poison.
+  chk "poison enveloped onto nba.dlq.snapshot-builder (consumer+source-topic+raw value)" \
+    "dlq_has_poison '$POISON' $dlqbase" "y" 25
   # 3) REPLAY the ORIGINAL good record to its SOURCE topic (a valid member fact) -> processed normally:
   #    the snapshot-builder LWW-writes it, so it appears in the member's lean snapshot. Proves replay is safe
-  #    + lossless (a real action rulefact, so the lean filter keeps it).
-  feed1 "$m" "operator.activity.daysSinceLogin" 20 LONG
-  chk "replayed good fact processed normally (lands in the snapshot — no data loss)" "has_fact $m operator.activity.daysSinceLogin" "y" 25
+  #    + lossless. Use operator.activity.loggedIn -- a fact some action actually references (it IS in
+  #    nba:rulefacts), so the lean filter keeps it on the snapshot (daysSinceLogin is NOT a rulefact -> dropped).
+  feed1 "$m" "operator.activity.loggedIn" true BOOL
+  chk "replayed good fact processed normally (lands in the snapshot — no data loss)" "has_fact $m operator.activity.loggedIn" "y" 25
 }
 
 # ============================ FACT ROUTING / RECONCILE (snapshot adaptation) ============================
