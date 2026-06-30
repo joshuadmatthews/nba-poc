@@ -23,6 +23,7 @@ public class Conf implements Serializable {
     public int debounceMaxRechecks;
     public long dispositionStepMs;
     public double hardFraction;
+    public boolean entryEarliest;
 
     public String memberFacts, snapshots, evaluations, definitions, facts, dlq, activations;
 
@@ -45,6 +46,12 @@ public class Conf implements Serializable {
         c.debounceMaxRechecks = Integer.parseInt(env("NBA_DEBOUNCE_MAX_RECHECKS", "4"));
         c.dispositionStepMs = Long.parseLong(env("NBA_DISPOSITION_STEP_MS", "1500"));
         c.hardFraction = Double.parseDouble(env("NBA_HARD_FRACTION", "0.4"));
+        // The member.facts ENTRY source normally starts at the live edge (latest) — additive, no history replay
+        // (see NbaFlinkApp.sourceStream). For a frozen-input REPLAY (the equivalence proof seeds members, THEN
+        // starts the engine), set NBA_OFFSET_RESET=earliest so the entry source folds the pre-seeded history and
+        // produces shadow output to diff. Inter-stage .shadow sources stay latest — those topics are freshly
+        // recreated (empty), so latest==earliest==offset 0 for them.
+        c.entryEarliest = "earliest".equalsIgnoreCase(env("NBA_OFFSET_RESET", "latest"));
         c.memberFacts = env("NBA_MEMBER_FACTS", "nba.member.facts");
         c.snapshots = env("NBA_TOPIC_OUT", "nba.snapshots");
         c.evaluations = env("NBA_EVALUATIONS_TOPIC", "nba.evaluations");

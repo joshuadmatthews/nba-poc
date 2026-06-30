@@ -1,5 +1,6 @@
 package ai.das.nba.flink;
 
+import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -22,7 +23,11 @@ final class SpineJob {
 
     /** STAGE 1 — SNAPSHOT: member.facts -> classify (defs/firehose/dlq side-outputs) -> keyed event-time LWW -> nba.snapshots. */
     static void stageSnapshot(StreamExecutionEnvironment env, Conf cfg) {
-        DataStream<FactRecord> facts = sourceStream(env, cfg, cfg.memberFacts, "facts");
+        // Entry source: live edge (latest) normally; full history (earliest) under NBA_OFFSET_RESET=earliest so a
+        // frozen-input equivalence replay sees the pre-seeded members (the .shadow loop-back below stays latest --
+        // its topic is freshly empty, so latest==offset 0 anyway).
+        DataStream<FactRecord> facts = sourceStream(env, cfg, cfg.memberFacts, "facts",
+                cfg.entryEarliest ? OffsetsInitializer.earliest() : OffsetsInitializer.latest());
         // Shadow mode: the pipeline's own loop-back facts (scores/router/state/dispositions) land on the .shadow
         // sibling; union it so the snapshot sees both live external facts AND the Flink loop (self-contained).
         // Authoritative writes the real member.facts, which this entry source already reads — no union needed.

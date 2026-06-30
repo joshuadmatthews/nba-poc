@@ -51,10 +51,10 @@ A **fact** is `{entityType, entityId, key, value, valueType, eventTs, source}` (
 
 | Key | Type | Produced by | Meaning |
 |-----|------|-------------|---------|
-| `operator.activity.daysSinceLogin` | LONG | lake (← `days_since_login`) | Days since last login. |
-| `operator.activity.completedTasks` | LONG | lake (← `completed_tasks`) | Onboarding tasks done. |
-| `operator.activity.viewedDashboard` | BOOLEAN | lake | Has viewed dashboard. |
-| `operator.activity.usedChat` | BOOLEAN | lake | Has used chat. |
+| `operator.activity.respondedToOutreach` | BOOLEAN | lake | Engaged with any outreach — unlocks the qualifying stage. |
+| `operator.activity.registeredForPortal` | BOOLEAN | lake | Completed member-portal registration. |
+| `operator.activity.hraCompleted` | BOOLEAN | lake | Finished the Health Risk Assessment. |
+| `operator.activity.pcpSelected` | BOOLEAN | lake | Selected a primary care physician. |
 | `operator.profile.isDNC` | BOOLEAN | lake (← `is_dnc`) | Do-Not-Contact. |
 | `operator.profile.smsConsent` | BOOLEAN | lake (← `sms_consent`) | SMS consent. |
 | `operator.comms.totalThisWeek` | LONG | lake comms-count | Total comms this rolling week. |
@@ -81,9 +81,9 @@ A **fact** is `{entityType, entityId, key, value, valueType, eventTs, source}` (
 {
   "entityType": "OPERATOR",
   "entityId": "op-sg-0",
-  "key": "operator.activity.daysSinceLogin",
-  "value": 20,
-  "valueType": "LONG",
+  "key": "operator.activity.respondedToOutreach",
+  "value": true,
+  "valueType": "BOOLEAN",
   "eventTs": 1749012345678,
   "source": "lake:crm-export",
   "origin": "lake"
@@ -122,10 +122,10 @@ Key: `SYSTEM:__throttle:nba.throttle.email.daily`.
   "correlationId": "550e8400-e29b-41d4-a716-446655440000",
   "updatedTs": 1749000005000,
   "facts": {
-    "operator.activity.daysSinceLogin": { "value": 20, "valueType": "LONG", "eventTs": 1749000001234, "source": "lake:crm-export" },
-    "operator.profile.isDNC":            { "value": false, "valueType": "BOOLEAN", "eventTs": 1749000001236, "source": "lake:crm-export" },
-    "nba.score.reengage.email":          { "value": 0.66, "valueType": "DOUBLE", "eventTs": 1749000003000, "source": "ml" },
-    "nba.actionstate.reengage.email":    { "value": "PRESENTED", "valueType": "STRING", "eventTs": 1749000004000, "source": "temporal" }
+    "operator.activity.respondedToOutreach": { "value": true, "valueType": "BOOLEAN", "eventTs": 1749000001234, "source": "lake:crm-export" },
+    "operator.profile.isDNC":                { "value": false, "valueType": "BOOLEAN", "eventTs": 1749000001236, "source": "lake:crm-export" },
+    "nba.score.action_reengage.email":       { "value": 17.5293, "valueType": "DOUBLE", "eventTs": 1749000003000, "source": "ml" },
+    "nba.actionstate.action_reengage.email": { "value": "PRESENTED", "valueType": "STRING", "eventTs": 1749000004000, "source": "temporal" }
   }
 }
 ```
@@ -143,9 +143,9 @@ Key: `SYSTEM:__throttle:nba.throttle.email.daily`.
   "eligibilityChanged": true,
   "channelActions": [
     {
-      "actionId": "reengage", "channel": "email", "name": "Reengage Email",
-      "ttlSeconds": 86400, "contentKey": "tmpl.reengage.base",
-      "eligible": true, "score": 0.66,
+      "actionId": "action_reengage", "channel": "email", "name": "Re-engage Lapsed Member",
+      "ttlSeconds": 600, "contentKey": "tmpl.action_reengage.email.v1",
+      "eligible": true, "score": 17.5293,
       "active": false, "cancellable": false,
       "softCompleted": false, "hardCompleted": false, "workflowState": null
     }
@@ -162,8 +162,8 @@ Single op (`CREATE` / `SUPPRESS` / `SOFT_COMPLETE` / `HARD_COMPLETE`), key `nbaI
 ```json
 {
   "nbaId": "nba_a1b2c3d4e5f6", "entityType": "OPERATOR", "entityId": "op-sg-0", "memberId": "op-sg-0",
-  "op": "CREATE", "actionId": "reengage", "channel": "email", "name": "Reengage Email",
-  "contentKey": "tmpl.reengage.base", "ttlSeconds": 86400, "score": 0.66,
+  "op": "CREATE", "actionId": "action_reengage", "channel": "email", "name": "Re-engage Lapsed Member",
+  "contentKey": "tmpl.action_reengage.email.v1", "ttlSeconds": 600, "score": 17.5293,
   "correlationId": "550e8400-...", "source": "action-router", "eventTs": 1749000007000
 }
 ```
@@ -176,10 +176,10 @@ Batch (`op=CREATE_BATCH`), key `nbaId:channel:batch`: no top-level `actionId`; i
   "op": "DISPATCH",
   "entityType": "OPERATOR", "memberId": "op-sg-0",
   "nbaId": "nba_a1b2c3d4e5f6", "entityId": "op-sg-0",
-  "actionId": "reengage", "channel": "email", "name": "Reengage Email",
-  "contentKey": "tmpl.reengage.base", "ttlSeconds": 86400, "score": 0.66,
+  "actionId": "action_reengage", "channel": "email", "name": "Re-engage Lapsed Member",
+  "contentKey": "tmpl.action_reengage.email.v1", "ttlSeconds": 600, "score": 17.5293,
   "correlationId": "550e8400-...",
-  "trackingId": "nba-ca:nba_a1b2c3d4e5f6:reengage:email|550e8400-...",
+  "trackingId": "nba-ca:nba_a1b2c3d4e5f6:action_reengage:email|550e8400-...",
   "source": "state-machine", "eventTs": 1749000010000
 }
 ```
@@ -200,7 +200,7 @@ So the serve→disposition journey is linkable downstream — in the lake and th
   "entityType": "OPERATOR", "memberId": "op-sg-0",
   "nbaId": "nba_a1b2c3d4e5f6", "entityId": "op-sg-0",
   "channel": "inbound",
-  "actions": [ { "actionId": "reengage", "state": "eligible", "score": 0.66 } ],
+  "actions": [ { "actionId": "action_reengage", "state": "eligible", "score": 17.5293 } ],
   "correlationId": "550e8400-...",
   "source": "inbound", "eventTs": 1749000010000
 }
@@ -212,13 +212,13 @@ So the serve→disposition journey is linkable downstream — in the lake and th
 ```json
 {
   "entityType": "OPERATOR", "entityId": "op-sg-0",
-  "key": "nba.disposition.reengage.email",
+  "key": "nba.disposition.action_reengage.email",
   "value": "Delivered",        // raw provider status — rules engine reads this
   "state": "PRESENTED",        // canonical delivery state — state machine reads this
   "valueType": "STRING", "eventTs": 1749000012000, "source": "action-layer",
   "correlationId": "550e8400-...", "memberId": "op-sg-0", "channel": "email",
-  "contentKey": "tmpl.reengage.base",
-  "trackingId": "nba-ca:nba_a1b2c3d4e5f6:reengage:email|550e8400-..."
+  "contentKey": "tmpl.action_reengage.email.v1",
+  "trackingId": "nba-ca:nba_a1b2c3d4e5f6:action_reengage:email|550e8400-..."
 }
 ```
 
@@ -227,7 +227,7 @@ So the serve→disposition journey is linkable downstream — in the lake and th
 ```json
 {
   "entityType": "OPERATOR", "entityId": "op-sg-0", "nbaId": "nba_a1b2c3d4e5f6",
-  "key": "nba.actionstate.reengage.email", "value": "IN_PROCESS", "valueType": "STRING",
+  "key": "nba.actionstate.action_reengage.email", "value": "IN_PROCESS", "valueType": "STRING",
   "eventTs": 1749000011000, "source": "temporal"
 }
 ```
@@ -236,9 +236,9 @@ So the serve→disposition journey is linkable downstream — in the lake and th
 
 ```json
 {
-  "key": "nba.score.reengage.email",
-  "value": { "actionId": "reengage", "channel": "email", "score": 0.66,
-             "name": "Reengage Email", "ttlSeconds": 86400, "contentKey": "tmpl.reengage.base",
+  "key": "nba.score.action_reengage.email",
+  "value": { "actionId": "action_reengage", "channel": "email", "score": 17.5293,
+             "name": "Re-engage Lapsed Member", "ttlSeconds": 600, "contentKey": "tmpl.action_reengage.email.v1",
              "correlationId": "550e8400-..." },
   "valueType": "OBJECT", "eventTs": 1749000008000, "source": "ml",
   "nbaId": "nba_a1b2c3d4e5f6", "entityType": "OPERATOR", "entityId": "op-sg-0"
@@ -250,18 +250,19 @@ So the serve→disposition journey is linkable downstream — in the lake and th
 
 ```json
 {
-  "id": "reengage", "name": "Reengage Email", "ttlSeconds": 86400,
-  "channels": [ { "channel": "email", "contentKey": "tmpl.reengage.base", "softCompletion": "LinkClicked",
-                  "touchKeys": [ "tmpl.reengage.touch1", "tmpl.reengage.touch2", "tmpl.reengage.touch3" ],
-                  "variants": [ { "contentKey": "tmpl.reengage.vip", "percent": 100,
-                                  "conditions": { "op": "all", "conditions": [ { "fact": "operator.tier", "cmp": "eq", "value": "premium" } ] } } ] } ],
-  "inclusion": { "op": "all", "conditions": [ { "fact": "operator.activity.daysSinceLogin", "cmp": "gte", "value": 14 } ] },
+  "id": "action_reengage", "name": "Re-engage Lapsed Member", "ttlSeconds": 600,
+  "channels": [ { "channel": "email", "contentKey": "tmpl.action_reengage.email.v1", "softCompletion": "LinkClicked",
+                  "touchKeys": [ "tmpl.action_reengage.email.touch1", "tmpl.action_reengage.email.touch2", "tmpl.action_reengage.email.touch3" ],
+                  "variants": [ { "contentKey": "tmpl.action_reengage.email.vip", "percent": 100,
+                                  "conditions": { "op": "all", "conditions": [ { "fact": "operator.profile.diabetic", "cmp": "eq", "value": true } ] } } ] } ],
+  "inclusion": { "op": "all", "conditions": [ { "fact": "operator.activity.respondedToOutreach", "cmp": "eq", "value": true } ] },
   "exclusion": { "op": "any", "conditions": [ { "fact": "operator.profile.isDNC", "cmp": "eq", "value": true } ] },
-  "completion": { "op": "all", "conditions": [ { "fact": "operator.activity.usedChat", "cmp": "eq", "value": true } ] },
+  "completion": { "op": "all", "conditions": [ { "fact": "operator.activity.hraCompleted", "cmp": "eq", "value": true } ] },
   "hardTtlSeconds": 604800, "autoExcludeOnCompletion": true,
-  "factsUsed": ["operator.activity.daysSinceLogin", "operator.profile.isDNC", "operator.activity.usedChat"]
+  "factsUsed": ["operator.activity.respondedToOutreach", "operator.profile.isDNC", "operator.activity.hraCompleted"]
 }
 ```
+(Illustrative composite — shows every optional field. The seeded `action_reengage` is simpler: always-on inclusion, `completion = respondedToOutreach`, no touchKeys/variants.)
 A channel's optional `touchKeys = [firstTouch, secondTouch, thirdTouch]` is the per-channel touch-template escalation: a monotonic per-(member, channel) send counter `n` selects `touchKeys[min(n, len) - 1]` (caps at the last template) at the single DISPATCH point. Absent `touchKeys` → the variant-selected `contentKey` is used unchanged.
 
 Other definition keys: `GLOBAL_RULE:{id}` / `CHANNEL_RULE:{id}` (a `{id, name, channel?, logic}` doc); `MILESTONE:{id}`; `THROTTLE:{ch}.{metric}` (a throttle fact body); `THROTTLE_HOT:{channel}`; `ACTION_SUPPRESS:{target}` (`{"value": true|false}`). A `null` payload is a compaction tombstone (delete).

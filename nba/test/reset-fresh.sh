@@ -21,7 +21,10 @@ cd "$(cd "$(dirname "$0")/.." && pwd)/.." 2>/dev/null   # repo root
 INFRA=nba/infra
 MEMBERS=0; [ "${1:-}" = "--members" ] && MEMBERS="${2:-0}"
 # spine consumers (NOT infra: redpanda/redis/temporal stay up). `restart` preserves the container + env.
-SPINE="ais-nba-snapshot-builder ais-nba-rules-engine ais-nba-journey-scorer ais-nba-conversion-sim ais-nba-action-router ais-nba-temporal-worker ais-nba-action-layer"
+# Includes ais-nba-bff + ais-nba-action-library: the suite reaches the action APIs via `podman exec ais-nba-bff
+# wget` -> a wedged/exited BFF silently breaks ~1/3 of the suite (al_post_action / next_action / inbound_disp all
+# return empty), so we revive them every reset rather than assume they survived.
+SPINE="ais-nba-snapshot-builder ais-nba-rules-engine ais-nba-journey-scorer ais-nba-conversion-sim ais-nba-action-router ais-nba-temporal-worker ais-nba-action-layer ais-nba-action-library ais-nba-bff"
 
 recreate(){ local t cfg parts
   for t in "$@"; do [ -z "$t" ] && continue

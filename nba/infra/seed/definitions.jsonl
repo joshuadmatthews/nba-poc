@@ -123,7 +123,7 @@ ACTION:action_loyalty_perk
 ACTION:action_success_story	
 ACTION:action_upgrade_call	
 THROTTLE:sms.daily	{"entityType":"SYSTEM","entityId":"__throttle","key":"nba.throttle.sms.daily","value":1990,"valueType":"LONG","eventTs":1782524051805,"source":"throttle-lake","origin":"lake","windowSeconds":300}
-THROTTLE:mail.daily	{"entityType":"SYSTEM","entityId":"__throttle","key":"nba.throttle.mail.daily","value":1157,"valueType":"LONG","eventTs":1782524051805,"source":"throttle-lake","origin":"lake","windowSeconds":300}
+THROTTLE:mail.daily	{"entityType":"SYSTEM","entityId":"__throttle","key":"nba.throttle.mail.daily","value":420,"valueType":"LONG","eventTs":1782524051805,"source":"throttle-lake","origin":"lake","windowSeconds":300}
 THROTTLE:email.rate	{"entityType":"SYSTEM","entityId":"__throttle","key":"nba.throttle.email.rate","value":128,"valueType":"LONG","eventTs":1782524051805,"source":"throttle-lake","origin":"lake","windowSeconds":300}
 THROTTLE:sms.rate	{"entityType":"SYSTEM","entityId":"__throttle","key":"nba.throttle.sms.rate","value":162,"valueType":"LONG","eventTs":1782524051805,"source":"throttle-lake","origin":"lake","windowSeconds":300}
 THROTTLE:voice.daily	{"entityType":"SYSTEM","entityId":"__throttle","key":"nba.throttle.voice.daily","value":405,"valueType":"LONG","eventTs":1782524051805,"source":"throttle-lake","origin":"lake","windowSeconds":300}

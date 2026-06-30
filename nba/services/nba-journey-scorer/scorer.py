@@ -21,7 +21,8 @@ import json
 import os
 import time
 
-from kafka import KafkaConsumer, KafkaProducer
+# NOTE: `kafka` is imported lazily inside main() so the PURE scoring functions (stable01 / score_action) can be
+# imported + unit-tested (test_scorer.py) without the kafka-python dependency installed.
 
 BOOT = os.environ.get("NBA_BOOTSTRAP", "nba-redpanda:9092")
 EVALS = os.environ.get("NBA_EVALUATIONS_TOPIC", "nba.evaluations")
@@ -58,6 +59,7 @@ def header(msg, key):
 
 
 def main():
+    from kafka import KafkaConsumer, KafkaProducer
     consumer = KafkaConsumer(
         EVALS, bootstrap_servers=BOOT, group_id=GROUP,
         auto_offset_reset=OFFSET, enable_auto_commit=True,

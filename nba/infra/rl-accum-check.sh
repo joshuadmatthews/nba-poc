@@ -3,13 +3,13 @@
 # Reports: training-data growth (n_real) + policy signal (train_auc) from the latest retrain, the OPE/promote
 # decision if available, journey breadth (is the chain still producing data), member count, and system health.
 set +e
-REPO="197121cd "197121dirname "-e")/../.." 2>/dev/null && pwd)"; cd "$REPO" 2>/dev/null
+REPO="C:/Users/Josh/source/repos/AIServices"; cd "$REPO" 2>/dev/null
 echo "===== RL ACCUM CHECK  $(date -u '+%Y-%m-%d %H:%M:%SZ') ====="
 
 ( unset DATABRICKS_CLIENT_ID DATABRICKS_CLIENT_SECRET DATABRICKS_TOKEN DATABRICKS_HOST
   set -a; source nba/databricks/ml/ml.env 2>/dev/null; set +a
   export DATABRICKS_HOST="$ML_DATABRICKS_HOST" DATABRICKS_CLIENT_ID="$ML_DATABRICKS_CLIENT_ID" DATABRICKS_CLIENT_SECRET="$ML_DATABRICKS_CLIENT_SECRET"
-  RID=$(MSYS_NO_PATHCONV=1 timeout 30 databricks api get "/api/2.1/jobs/runs/list?job_id=<job-id>&limit=4" 2>/dev/null | python -c "
+  RID=$(MSYS_NO_PATHCONV=1 timeout 30 databricks api get "/api/2.1/jobs/runs/list?job_id=336894478274634&limit=4" 2>/dev/null | python -c "
 import sys,json
 for r in json.load(sys.stdin).get('runs',[]):
     if r.get('state',{}).get('result_state')=='SUCCESS': print(r['run_id']); break")

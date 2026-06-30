@@ -283,8 +283,8 @@ both go out.
 >   a **single dot**, because operator suppression targets are authored as `actionId` (whole action) or
 >   `actionId.channel` (one channel). The suppression set is keyed with `.`, the slot identity with `::`.
 
-**Test.** `t_supersede` — Survey/push (0.61) activates first; a fact bump makes Reengage/email (0.66) eligible;
-Survey ends `suppressed` (superseded) and Reengage reaches `sent`.
+**Test.** `t_supersede` — two email siblings (hra/email + portal/email) enter the debounce window together; the
+lower-scored one self-DEBOUNCEs (sibling dedup — nothing sent) and the winner walks past debounce to SOFT_COMPLETED.
 
 ---
 
@@ -308,8 +308,8 @@ actions on the winning channel should go out as **one** send but track **N** ind
 
 `readMaxBatch` reads `nba:channel:maxbatch` (default 1). `maxBatch <= 1` → the single-action path (unchanged).
 
-**Test.** `t_batch` — `al_maxbatch email 2`; both email actions (Reengage + Dashboard) reach `sent` from one
-batch dispatch.
+**Test.** `t_batch` — `al_maxbatch email 2`; two email actions (hra/email + portal/email) both walk to
+SOFT_COMPLETED from ONE batch dispatch (one CREATE → two tracking children).
 
 ---
 
@@ -339,14 +339,13 @@ The Java `condPass` mirrors it exactly: `actual == null ? 0.0 : ...` for numbers
 null-coalesced string for booleans, `actual == null ? "" : ...` for strings. **`exists` is special-cased** in
 *both* paths — it asks about presence and is never coalesced (`"exists".equals(cmp) → get(fact) != null`).
 
-**Test.** `t_missing_facts_default` — a member with **only** `completedTasks=7`:
-- missing `isDNC` → `false` → not excluded,
-- missing counts → `0` → under all caps,
-- missing `viewedDashboard` → `false` → Dashboard eligible,
-- missing `daysSinceLogin` → `0` → Reengage (needs ≥14) **not** eligible.
+**Test.** `t_missing_facts_default` — a member with **only** `isDNC=false` (no journey facts):
+- missing comms counts → `0` → under all caps,
+- no `respondedToOutreach` → the funnel actions (portal_registration, hra, …) stay **LOCKED**,
+- so only the empty-inclusion always-on actions qualify.
 
-Result asserted: `Survey/push + Dashboard/email`. (`t_dnc_excludes_survey` proves the inverse: an explicit
-`isDNC=true` fires Survey's exclusion.)
+Result asserted: `plan_welcome` + `reengage` eligible, `portal_registration` LOCKED. (`t_dnc_excludes_survey`
+proves the inverse: an explicit `isDNC=true` fires the global "No DNC" rule and **nothing** is eligible.)
 
 ---
 
@@ -445,7 +444,7 @@ evals (`applyThrottle` → `CHANNEL_HOT_UNTIL.remove(ch)`). The `throttle-lake` 
 count telemetry can't race-clear a live saturation.
 
 **Tests.**
-- `t_throttle_saturation` — `throttle_hot email` → email excluded, ML re-scores to Survey/push. (Runs **last**
+- `t_throttle_saturation` — `throttle_hot email` → email channels excluded, push survives (ML re-scores). (Runs **last**
   in the suite because it marks email HOT.)
 - `t_throttle_sms_fallback` / `t_throttle_lifecycle_sms` — the headline flow: email capped → the send actually
   goes out on **SMS** instead.

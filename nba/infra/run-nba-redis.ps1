@@ -17,7 +17,10 @@ $ARGS = @(
   '--restart', 'unless-stopped', '--label', 'ais.boot.wave=15',
   '-v', 'ais-nba-redis-data:/data',
   $IMG,
-  'redis-server', '--appendonly', 'yes', '--maxmemory', '256mb', '--maxmemory-policy', 'noeviction'
+  # 8gb (~1.7M members @ ~4.6KB) -- a FAIR ceiling vs the disk-backed engines (RocksDB/Flink get the whole disk).
+  # The old 256mb capped the central state store at ~55k members on a 32GB VM, which made the throughput comparison
+  # unfair (it OOM'd classic at a tiny member count while the disk engines had unbounded state). See PERFORMANCE.md §3/§6.
+  'redis-server', '--appendonly', 'yes', '--maxmemory', '8gb', '--maxmemory-policy', 'noeviction'
 )
 
 if ($DryRun) { Write-Host "DRY RUN:"; Write-Host ("podman run " + ($ARGS -join ' ')); exit 0 }

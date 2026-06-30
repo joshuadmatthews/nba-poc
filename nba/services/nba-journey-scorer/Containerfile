@@ -5,5 +5,7 @@ FROM docker.io/library/python:3.11-slim
 WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-COPY scorer.py ./
+COPY scorer.py test_scorer.py ./
+# Gate the image on the scorer's unit tests (pure functions; kafka import is lazy so no broker needed at build).
+RUN python -m unittest test_scorer
 CMD ["python", "scorer.py"]

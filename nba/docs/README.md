@@ -36,8 +36,8 @@ Source systems stream raw, dialect-specific records into a Databricks **medallio
 ## Conventions
 
 - **Member / operator** — the person an action targets. Identified externally by `entityType:entityId`, internally by a minted `nbaId`.
-- **Fact** — one typed key/value about a member, e.g. `operator.activity.daysSinceLogin = 20`.
-- **Action** — an authored thing you might do (e.g. "Reengage Email"). It runs on one or more **channels**.
+- **Fact** — one typed key/value about a member, e.g. `operator.activity.respondedToOutreach = true`.
+- **Action** — an authored thing you might do (e.g. "Plan Welcome", "Health Risk Assessment"). It runs on one or more **channels**.
 - **ChannelAction** — one (action, channel) pair. The unit of decisioning and the unit of the state machine.
 - **nba-inbound-sim** — a local client that models real inbound members by driving the inbound hot-path APIs (serve → disposition → completion) on the action-library.
 - All code references are `file:line`. All services are single-purpose Java 21 apps except the lake (PySpark) and the Command Center (Node BFF + React UI).

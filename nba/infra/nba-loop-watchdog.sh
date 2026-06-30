@@ -11,7 +11,7 @@
 #
 # Usage:  POLL_S=150 MAX_POLLS=30 bash nba/infra/nba-loop-watchdog.sh
 set +e
-REPO="197121cd "197121dirname "-e")/../.." 2>/dev/null && pwd)"; cd "$REPO" 2>/dev/null
+REPO="C:/Users/Josh/source/repos/AIServices"; cd "$REPO" 2>/dev/null
 PANDA=ais-nba-redpanda; REDIS=ais-nba-redis
 PX(){ MSYS_NO_PATHCONV=1 podman "$@"; }
 POLL_S=${POLL_S:-150}; MAX_POLLS=${MAX_POLLS:-30}; GRACE=${GRACE:-3}; STALL_NEED=${STALL_NEED:-2}
