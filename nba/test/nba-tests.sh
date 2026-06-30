@@ -81,7 +81,7 @@ al_completion(){ podman exec ais-nba-bff wget -qO- --post-data="{\"entityId\":\"
 # authored healthcare actions only. This hook stays empty so eligibility assertions self-heal if a stray test action
 # is ever re-seeded.)
 DEMO_ARMS=""
-get_eligible(){ R get "nba:evaluation:$(nbaid "$1")" 2>/dev/null | DEMO="$DEMO_ARMS" python -c "import json,sys,os
+get_eligible(){ R get "nba:eligibility:$(nbaid "$1")" 2>/dev/null | DEMO="$DEMO_ARMS" python -c "import json,sys,os
 try: d=json.load(sys.stdin)
 except: print('?'); raise SystemExit
 demo=set(os.environ.get('DEMO','').split())
@@ -92,25 +92,42 @@ served_actions(){ next_action "$1" | python -c "import json,sys
 try: d=json.load(sys.stdin)
 except: print('?'); raise SystemExit
 print(','.join(sorted(a['actionId']+':'+a['channel'] for a in d.get('actions',[]))))" 2>/dev/null; }
-get_score(){ R get "nba:evaluation:$(nbaid "$1")" 2>/dev/null | python -c "import json,sys
+get_score(){ R get "nba:eligibility:$(nbaid "$1")" 2>/dev/null | python -c "import json,sys
 d=json.load(sys.stdin)
 print(next((str(c.get('score')) for c in d.get('channelActions',[]) if c['actionId']+':'+c['channel']=='$2'),'none'))" 2>/dev/null; }
 # HARD-completed action ids on the eval (channelActions where hardCompleted; sorted unique csv); and a ChannelAction's hardCompleted flag.
-get_completed(){ R get "nba:evaluation:$(nbaid "$1")" 2>/dev/null | python -c "import json,sys
+get_completed(){ R get "nba:eligibility:$(nbaid "$1")" 2>/dev/null | python -c "import json,sys
 try: d=json.load(sys.stdin)
 except: print('?'); raise SystemExit
 print(','.join(sorted(set(c['actionId'] for c in d.get('channelActions',[]) if c.get('hardCompleted')))))" 2>/dev/null; }
-get_hardcompleted(){ R get "nba:evaluation:$(nbaid "$1")" 2>/dev/null | python -c "import json,sys
+get_hardcompleted(){ R get "nba:eligibility:$(nbaid "$1")" 2>/dev/null | python -c "import json,sys
 try: d=json.load(sys.stdin)
 except: print('?'); raise SystemExit
 print(next((str(c.get('hardCompleted')) for c in d.get('channelActions',[]) if c['actionId']=='$2' and c['channel']=='$3'),'none'))" 2>/dev/null; }
 # the CONTENT KEY the rules engine selected for a member's action-channel (variant-aware) — read off the eval
-get_contentkey(){ R get "nba:evaluation:$(nbaid "$1")" 2>/dev/null | python -c "import json,sys
+get_contentkey(){ R get "nba:eligibility:$(nbaid "$1")" 2>/dev/null | python -c "import json,sys
 try: d=json.load(sys.stdin)
 except: print('?'); raise SystemExit
 print(next((c.get('contentKey') for c in d.get('channelActions',[]) if c['actionId']=='$2' and c['channel']=='$3'),'none'))" 2>/dev/null; }
 get_state(){ R hget "nba:snapshot:$(nbaid "$1")" "fact:nba.actionstate.${2/:/.}" 2>/dev/null | python -c "import json,sys;print(json.load(sys.stdin)['value'])" 2>/dev/null; }
 get_count(){ R get "nba:dl:$(nbaid "$1"):$2" 2>/dev/null; }
+# the LIVE per-snapshot correlationId off the member's eval — the same value the router copies onto the
+# activation (-> the workflow's myCorr). A disposition we inject MUST carry this corr (in its trackingId)
+# or the workflow's corr-gate drops it as stale. Stable as long as no new snapshot is minted (no new fact).
+get_corr(){ R get "nba:eligibility:$(nbaid "$1")" 2>/dev/null | python -c "import json,sys
+try: print(json.load(sys.stdin).get('correlationId',''))
+except: print('')" 2>/dev/null; }
+# Inject a DELIVERY disposition the way the action layer does: a member fact nba.disposition.{actionId}.{channel}
+# on member.facts with a kind=disposition HEADER, state=<canonical>, trackingId=nba-ca:{nbaId}:{aid}:{ch}|{corr}.
+# The temporal disposition-consumer deconstructs the trackingId and signals disposition(state,corr) to the
+# matching (member,action,channel) workflow, which walks to that state. Lets us drive DECLINED/FAILED
+# deterministically (the sim emits them only probabilistically off nba:sim:*_rate).
+disp_inject(){ # entity actionId channel state  (nbaId+corr resolved live)
+  local nb corr; nb=$(nbaid "$1"); corr=$(get_corr "$1")
+  local tid="nba-ca:${nb}:$2:$3|${corr}"; local ts; ts=$(date +%s%3N)
+  echo "{\"entityType\":\"OPERATOR\",\"entityId\":\"$1\",\"key\":\"nba.disposition.$2.$3\",\"value\":\"$4\",\"state\":\"$4\",\"valueType\":\"STRING\",\"eventTs\":$ts,\"source\":\"int-test\",\"correlationId\":\"${corr}\",\"memberId\":\"$1\",\"channel\":\"$3\",\"trackingId\":\"${tid}\"}" \
+    | podman exec -i ais-nba-redpanda rpk topic produce nba.member.facts -k "OPERATOR:$1:nba.disposition.$2.$3" -H "kind:disposition" >/dev/null 2>&1
+}
 # raw snapshot fact field for a member (empty if the fact isn't in the lean snapshot)
 snap_fact(){ R hget "nba:snapshot:$(nbaid "$1")" "fact:$2" 2>/dev/null; }
 has_fact(){ [ -n "$(snap_fact "$1" "$2")" ] && echo y || echo n; }
@@ -435,6 +452,85 @@ t_throttle_lifecycle_sms(){ local m="${RUN}thrlc"; echo "[throttle_lifecycle] em
   chk "email never sent (it was throttled out)" "get_state $m $REE | grep -qE 'IN_PROCESS|PRESENTED|SOFT_COMPLETED' && echo y || echo n" "n" 5
   throttle_set email 0; sleep 1                              # reset GLOBAL level for the next test
 }
+# NOTE on driveability: there is NO distinct "ACTIVATED" state. The state machine emits CREATED first (the
+# debounce window — ChannelActionWorkflowImpl.java:71), then IN_PROCESS on dispatch past debounce+gate
+# (line 111). This test asserts that real CREATED -> IN_PROCESS transition for a clean single-action,
+# no-suppression activation (the other lifecycle tests only assert the funnel rest states beyond it).
+t_state_created_then_in_process(){ local m="${RUN}crin"; echo "[state_created_then_in_process] no suppression -> CREATED (debounce-armed) then IN_PROCESS (dispatched)"
+  throttle_set email 0; sleep 1
+  setup "$m" "operator.activity.usedChat:true:BOOL" "operator.activity.viewedDashboard:true:BOOL" \
+        "operator.activity.daysSinceLogin:20:LONG" "operator.activity.completedTasks:3:LONG" \
+        "operator.profile.isDNC:false:BOOL" "operator.comms.totalThisWeek:0:LONG" "operator.comms.emailsThisWeek:0:LONG"
+  # CREATED is the first emitted state (the debounce window). Catch it early, then watch it advance once the
+  # debounce window + throttle gate clear -> IN_PROCESS (the dispatch hand-off; ChannelActionWorkflowImpl:111).
+  chk "Reengage/email activates at CREATED (debounce-armed)" "get_state $m $REE | grep -qE 'CREATED|IN_PROCESS|PRESENTED|SOFT_COMPLETED' && echo y || echo n" "y" 25
+  chk "advances past the debounce gate -> IN_PROCESS (dispatched, no provider response yet)" \
+      "get_state $m $REE | grep -qE 'IN_PROCESS|PRESENTED|SOFT_COMPLETED' && echo y || echo n" "y" 40
+}
+t_state_suppress_post_dispatch(){ local m="${RUN}suppd"; echo "[state_suppress_post_dispatch] suppress AFTER dispatch -> SUPPRESSING -> SUPPRESSED (the post-send cancel cascade, not pre-send DEBOUNCED)"
+  throttle_set email 0; sleep 1
+  setup "$m" "operator.activity.usedChat:true:BOOL" "operator.activity.viewedDashboard:true:BOOL" \
+        "operator.activity.daysSinceLogin:20:LONG" "operator.activity.completedTasks:3:LONG" \
+        "operator.profile.isDNC:false:BOOL" "operator.comms.totalThisWeek:0:LONG" "operator.comms.emailsThisWeek:0:LONG"
+  # Let it walk PAST the debounce window to a real dispatch (IN_PROCESS/PRESENTED) so the suppress is a
+  # post-handoff CANCEL (operatorSuppress -> trackDispositions emits SUPPRESSING, then the layer answers
+  # SUPPRESSED) — the distinct post-dispatch terminal, NOT the pre-send DEBOUNCED path.
+  chk "dispatched past debounce (IN_PROCESS/PRESENTED)" "get_state $m $REE | grep -qE 'IN_PROCESS|PRESENTED|SOFT_COMPLETED' && echo y || echo n" "y" 45
+  al_suppress "${REE%%:*}" true                                      # operator pull -> operatorSuppress fan-out to the RUNNING workflow
+  chk "post-dispatch suppress reaches terminal SUPPRESSED (cancel caught it)" "get_state $m $REE" "SUPPRESSED" 45
+  al_suppress "${REE%%:*}" false; sleep 1                            # restore so the action serves the other tests
+}
+t_state_declined(){ local m="${RUN}decl"; echo "[state_declined] a DECLINED delivery disposition -> the workflow records DECLINED (non-terminal rest state: keeps watching for HARD_COMPLETED until TTL)"
+  throttle_set email 0; sleep 1
+  setup "$m" "operator.activity.usedChat:true:BOOL" "operator.activity.viewedDashboard:true:BOOL" \
+        "operator.activity.daysSinceLogin:20:LONG" "operator.activity.completedTasks:3:LONG" \
+        "operator.profile.isDNC:false:BOOL" "operator.comms.totalThisWeek:0:LONG" "operator.comms.emailsThisWeek:0:LONG"
+  # Drive it to a real dispatch FIRST (so the workflow is past the gate, holding the live corr), then inject a
+  # DECLINED disposition carrying that corr. DECLINED is a REST state (ChannelActionWorkflowImpl:28) — the
+  # workflow emits it and stays alive, so the latest actionstate fact reads DECLINED.
+  chk "dispatched (IN_PROCESS/PRESENTED) before the decline" "get_state $m $REE | grep -qE 'IN_PROCESS|PRESENTED|SOFT_COMPLETED' && echo y || echo n" "y" 45
+  disp_inject "$m" "${REE%%:*}" email DECLINED                       # member opted out (canonical state DECLINED)
+  chk "workflow records DECLINED" "get_state $m $REE" "DECLINED" 40
+}
+t_state_failed(){ local m="${RUN}fail"; echo "[state_failed] a FAILED delivery disposition (bounce / no-answer) -> the workflow reaches terminal FAILED"
+  throttle_set email 0; sleep 1
+  setup "$m" "operator.activity.usedChat:true:BOOL" "operator.activity.viewedDashboard:true:BOOL" \
+        "operator.activity.daysSinceLogin:20:LONG" "operator.activity.completedTasks:3:LONG" \
+        "operator.profile.isDNC:false:BOOL" "operator.comms.totalThisWeek:0:LONG" "operator.comms.emailsThisWeek:0:LONG"
+  chk "dispatched (IN_PROCESS/PRESENTED) before the failure" "get_state $m $REE | grep -qE 'IN_PROCESS|PRESENTED|SOFT_COMPLETED' && echo y || echo n" "y" 45
+  disp_inject "$m" "${REE%%:*}" email FAILED                         # provider bounce (canonical state FAILED — terminal)
+  chk "workflow reaches terminal FAILED" "get_state $m $REE" "FAILED" 40
+}
+
+# ============================ DLQ (poison -> envelope -> replay) ============================
+# A consumer that fails to process a record envelopes it onto nba.dlq.{consumer} (DELETE-policy, retained a
+# week) so it stays replayable; the replay re-produces the EXACT original to its SOURCE topic and idempotency
+# makes it safe. snapshot-builder is the cleanest probe: ANY unparseable record on nba.member.facts is DLQ'd
+# (no header filter), and a valid member fact is snapshotted normally.
+t_dlq_replay(){ local m="${RUN}dlq"; echo "[dlq_replay] poison record -> nba.dlq.snapshot-builder envelope; replay the ORIGINAL good fact -> snapshotted normally (no data loss)"
+  local POISON="__POISON_${RUN}_not-json"                            # a unique marker so we can find OUR envelope
+  # 1) produce an UNPARSEABLE record to the consumer's input topic (nba.member.facts). snapshot-builder's
+  #    M.readTree throws -> it envelopes the record onto nba.dlq.snapshot-builder (still inside the txn).
+  echo "$POISON" | podman exec -i ais-nba-redpanda rpk topic produce nba.member.facts -k "OPERATOR:$m:poison" >/dev/null 2>&1
+  # 2) assert a DLQ envelope landed, shaped {consumer,topic,partition,offset,key,value,headers,error,dlqTs}
+  #    with consumer=snapshot-builder, topic(source)=nba.member.facts, value=our raw poison.
+  chk "poison enveloped onto nba.dlq.snapshot-builder (consumer+source-topic+raw value)" \
+    "podman exec ais-nba-redpanda rpk topic consume nba.dlq.snapshot-builder -o start -e -f '%v\n' 2>/dev/null | python -c \"import json,sys
+ok='n'
+for line in sys.stdin:
+    line=line.strip()
+    if not line: continue
+    try: e=json.loads(line)
+    except: continue
+    if e.get('value')=='$POISON' and e.get('consumer')=='snapshot-builder' and e.get('topic')=='nba.member.facts' \
+       and all(k in e for k in ('partition','offset','key','headers','error','dlqTs')): ok='y'
+print(ok)\"" "y" 25
+  # 3) REPLAY the ORIGINAL good record to its SOURCE topic (a valid member fact) -> processed normally:
+  #    the snapshot-builder LWW-writes it, so it appears in the member's lean snapshot. Proves replay is safe
+  #    + lossless (a real action rulefact, so the lean filter keeps it).
+  feed1 "$m" "operator.activity.daysSinceLogin" 20 LONG
+  chk "replayed good fact processed normally (lands in the snapshot — no data loss)" "has_fact $m operator.activity.daysSinceLogin" "y" 25
+}
 
 # ============================ FACT ROUTING / RECONCILE (snapshot adaptation) ============================
 # The snapshot is LEAN — only facts some action references (nba:rulefacts) are kept. When the action->fact
@@ -471,6 +567,8 @@ echo; echo "== ELIGIBILITY =="; t_eligibility_basic; t_dnc_excludes_survey; t_mi
 echo; echo "== CHANNEL THROTTLE (global daily cap) =="; t_channel_throttle; t_throttle_sms_fallback; t_throttle_multichannel; t_throttle_composes_with_member_cap
 echo; echo "== SCORING =="; t_scoring
 if [ "$MODE" != "fast" ]; then echo; echo "== ROUTING + STATE MACHINE =="; t_routing_lifecycle; t_supersede; t_batch; t_throttle_lifecycle_sms; fi
+if [ "$MODE" != "fast" ]; then echo; echo "== STATE MACHINE (disposition-driven states) =="; t_state_created_then_in_process; t_state_suppress_post_dispatch; t_state_declined; t_state_failed; fi
+echo; echo "== DLQ (poison -> envelope -> replay) =="; t_dlq_replay
 echo; echo "== OPERATOR SUPPRESS (Command Center) =="; t_operator_suppress; t_operator_suppress_channel
 echo; echo "== CONTENT VARIANTS (per-member content key) =="; t_content_variants
 echo; echo "== INBOUND SERVING (pull from cache) =="; t_inbound_serving

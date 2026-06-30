@@ -53,7 +53,18 @@ public class RulesEngine {
     // states / dispositions / milestones are durable facts and never expire. 0 (default) disables = carry-forever
     // (prior behavior). Refresh path: the daily bulk re-scores everyone, so set TTL ~1.5-2x the bulk cadence and
     // the gate is a pure safety net for scores the bulk missed.
-    static final long SCORE_TTL_MS = Long.parseLong(System.getenv().getOrDefault("NBA_SCORE_TTL_SECONDS", "0")) * 1000L;
+    // Package-private (NOT final) so a unit test can pin it; production still defaults from the env at class load.
+    static long SCORE_TTL_MS = Long.parseLong(System.getenv().getOrDefault("NBA_SCORE_TTL_SECONDS", "0")) * 1000L;
+
+    /** SCORE-TTL gate (pure, testable). True = this fact is a STALE nba.score.* and must be dropped from the
+     *  evaluation. ONLY nba.score.* facts expire — completions / lifecycle states / dispositions / milestones are
+     *  durable and never drop here. ttlMs<=0 (default) disables the gate (carry-forever). A score with no/zero
+     *  eventTs is kept (we can't age it). The production caller passes SCORE_TTL_MS + System.currentTimeMillis(). */
+    static boolean scoreExpired(String factKey, JsonNode factNode, long ttlMs, long nowMs) {
+        if (ttlMs <= 0 || factKey == null || !factKey.startsWith("nba.score.")) return false;
+        long ets = factNode == null ? 0L : factNode.path("eventTs").asLong(0L);
+        return ets > 0L && (nowMs - ets) > ttlMs;
+    }
 
     // Stored definitions (so we can attach actions to results + rebuild the pack).
     static final Map<String, JsonNode> actions = new ConcurrentHashMap<>();
@@ -200,12 +211,9 @@ public class RulesEngine {
                 // snapshot fact envelope ({value,valueType,eventTs,source}); past the TTL we skip it entirely ->
                 // f.get("nba.score...") is null below -> the channelAction emits score=null -> the router won't
                 // pick it AND the scorer re-scores the now-unscored-but-eligible action. nba.score.* only.
-                if (SCORE_TTL_MS > 0 && fk.startsWith("nba.score.")) {
-                    long ets = e.getValue().path("eventTs").asLong(0L);
-                    if (ets > 0L && (nowMs - ets) > SCORE_TTL_MS) {
-                        Metrics.counter("nba_rules_scores_expired_total").increment();
-                        continue;   // stale score -> absent from this evaluation
-                    }
+                if (scoreExpired(fk, e.getValue(), SCORE_TTL_MS, nowMs)) {
+                    Metrics.counter("nba_rules_scores_expired_total").increment();
+                    continue;   // stale score -> absent from this evaluation
                 }
                 f.put(fk, typedValue(e.getValue()));
             }

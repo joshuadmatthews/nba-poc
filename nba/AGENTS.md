@@ -28,9 +28,12 @@ evaluations. Boot order is the `ais.boot.wave=N` labels (15 infra → 16 → …
 ```bash
 bash nba/test/nba-tests.sh          # integration suite (drives the live stack, asserts at each layer)
 bash nba/test/nba-tests.sh fast     # skip the slow Temporal-lifecycle tests
+bash nba/test/engine-parity.sh      # cross-engine shadow-diff DIAGNOSTIC (see its header: a live diff measures a
+                                    # journey-timing race, not logic equiv; rigorous equiv = golden-fixture unit tests)
 bash nba/infra/run-loadtests.sh     # per-stage throughput matrix (classic spine)
 bash nba/infra/run-loadtests.sh --engines   # also the Flink shadow rules stage
 ```
+Per-service unit tests run inside the image build (`gradle test shadowJar` gates each `run.ps1 -Build`).
 Tests use a fresh member id per run (no reset needed). Lifecycle tests need the temporal worker on a short
 debounce: `pwsh nba/services/nba-temporal/run.ps1 -DebounceSeconds 10`.
 

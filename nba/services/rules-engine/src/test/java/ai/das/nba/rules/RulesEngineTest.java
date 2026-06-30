@@ -711,4 +711,88 @@ class RulesEngineTest {
         RulesEngine.applyActionSuppress("act_x", "{\"actionId\":\"act_x\"}");
         assertFalse(RulesEngine.isOperatorSuppressed("act_x", "email"));
     }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    // SCORE TTL (NBA_SCORE_TTL_SECONDS) — a stale nba.score.* fact is DROPPED from the evaluation so
+    // the router never acts on it; the eligible-but-unscored eval then re-triggers the scorer. The TTL
+    // gate is a pure helper (scoreExpired) so it is testable with a pinned "now" — production still
+    // passes SCORE_TTL_MS (env-defaulted) + System.currentTimeMillis(). Contract under test:
+    //   - past the TTL: an nba.score.{a}.{c} fact is dropped (so score key is absent / score=null);
+    //   - within the TTL: a FRESH score is KEPT;
+    //   - completion / actionstate / milestone / disposition facts NEVER expire (only nba.score.*);
+    //   - TTL=0 (default) drops NOTHING (carry-forever, prior behavior).
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+
+    /** A snapshot fact envelope {value,valueType,eventTs,source} — the shape the eval gates on (eventTs is what ages). */
+    static JsonNode fact(Object value, long eventTs) {
+        ObjectNode fv = RulesEngine.M.createObjectNode();
+        if (value == null) fv.putNull("value");
+        else if (value instanceof Boolean b) fv.put("value", b);
+        else if (value instanceof Integer i) fv.put("value", i);
+        else if (value instanceof Long l) fv.put("value", l);
+        else if (value instanceof Double d) fv.put("value", d);
+        else fv.put("value", value.toString());
+        fv.put("eventTs", eventTs);
+        return fv;
+    }
+
+    static final long TTL_60S = 60_000L;
+    static final long NOW = 1_000_000_000_000L;   // a fixed wall clock so the test is deterministic
+
+    @Test
+    void scoreExpired_staleScore_isDropped() {
+        // a score whose eventTs is OLDER than the 60s TTL -> EXPIRED (dropped from the eval -> score=null -> router skips it).
+        long staleTs = NOW - (TTL_60S + 1_000L);   // 61s old
+        assertTrue(RulesEngine.scoreExpired("nba.score.act1.email", fact(0.91d, staleTs), TTL_60S, NOW),
+                "score 61s old with a 60s TTL is stale -> dropped");
+    }
+
+    @Test
+    void scoreExpired_freshScore_isKept() {
+        // a score within the TTL window -> NOT expired (kept; the router can act on it).
+        long freshTs = NOW - (TTL_60S - 1_000L);   // 59s old
+        assertFalse(RulesEngine.scoreExpired("nba.score.act1.email", fact(0.91d, freshTs), TTL_60S, NOW),
+                "score 59s old with a 60s TTL is fresh -> kept");
+        // exactly AT the TTL boundary is still kept (gate is strictly-greater-than: now-ets > ttl).
+        assertFalse(RulesEngine.scoreExpired("nba.score.act1.email", fact(0.91d, NOW - TTL_60S), TTL_60S, NOW),
+                "exactly at the TTL boundary is kept (strict >)");
+    }
+
+    @Test
+    void scoreExpired_onlyScoreFactsExpire_durableFactsNeverDrop() {
+        // Even with an ancient eventTs, NON-score facts are durable and NEVER expire — only nba.score.* ages out.
+        long ancientTs = NOW - (TTL_60S * 10_000L);   // absurdly old
+        assertFalse(RulesEngine.scoreExpired("nba.completion.act1", fact(true, ancientTs), TTL_60S, NOW),
+                "completions are durable -> never dropped");
+        assertFalse(RulesEngine.scoreExpired("nba.actionstate.act1.email", fact("PRESENTED", ancientTs), TTL_60S, NOW),
+                "lifecycle states are durable -> never dropped");
+        assertFalse(RulesEngine.scoreExpired("nba.milestone.m1", fact(true, ancientTs), TTL_60S, NOW),
+                "milestones are durable -> never dropped");
+        assertFalse(RulesEngine.scoreExpired("nba.disposition.act1.email", fact("Unsubscribe", ancientTs), TTL_60S, NOW),
+                "dispositions are durable -> never dropped");
+        // ...and a stale SCORE with the same ancient eventTs DOES drop — proving the prefix is what gates it.
+        assertTrue(RulesEngine.scoreExpired("nba.score.act1.email", fact(0.5d, ancientTs), TTL_60S, NOW),
+                "same ancient eventTs on a score -> dropped (only nba.score.* expires)");
+    }
+
+    @Test
+    void scoreExpired_ttlZero_dropsNothing_carryForever() {
+        // TTL=0 (the default / NBA_SCORE_TTL_SECONDS unset) DISABLES the gate — even an ancient score is carried forever.
+        long ancientTs = NOW - (TTL_60S * 10_000L);
+        assertFalse(RulesEngine.scoreExpired("nba.score.act1.email", fact(0.5d, ancientTs), 0L, NOW),
+                "TTL=0 -> gate disabled -> nothing dropped (prior behavior)");
+        // a negative TTL is also treated as disabled (defensive).
+        assertFalse(RulesEngine.scoreExpired("nba.score.act1.email", fact(0.5d, ancientTs), -1L, NOW));
+    }
+
+    @Test
+    void scoreExpired_scoreWithoutEventTs_isKept() {
+        // a score whose envelope carries no usable eventTs (0 / absent) can't be aged -> KEPT (we never drop a score we can't time).
+        assertFalse(RulesEngine.scoreExpired("nba.score.act1.email", fact(0.91d, 0L), TTL_60S, NOW),
+                "eventTs=0 -> not ageable -> kept");
+        ObjectNode noTs = RulesEngine.M.createObjectNode();
+        noTs.put("value", 0.91d);   // no eventTs field at all
+        assertFalse(RulesEngine.scoreExpired("nba.score.act1.email", noTs, TTL_60S, NOW),
+                "missing eventTs -> not ageable -> kept");
+    }
 }
