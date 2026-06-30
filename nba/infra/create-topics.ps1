@@ -24,6 +24,7 @@ $topics = @(
   # nothing consumes it. Don't recreate it. (The lake no longer emits it; see nba_datalake_stream.emit_inbound.)
   'nba.member.facts',  # curated subset some action cares about; snapshot-builder input
   'nba.snapshots',     # snapshot-builder output: per-NBAID current state
+  'nba.evaluations',   # rules-engine output: eligible channelActions[] per member (was relying on broker auto-create)
   'nba.activations',   # action-router output: CREATE/SUPPRESS per (member,action,channel)
   'nba.definitions'    # latest action/rule defs + THROTTLE:{channel} level (broadcast to every rules-engine instance)
 )
@@ -48,8 +49,6 @@ podman exec ais-nba-redpanda rpk topic alter-config nba.definitions --set cleanu
 # topic and idempotency (event-time LWW / Temporal workflow-id dedup) makes the replay safe.
 $dlqs = @(
   'nba.dlq.snapshot-builder',      # snapshot-builder (nba.member.facts -> Redis snapshots)
-  'nba.dlq.ml-scorer-features',    # ml-scorer feature store (nba.facts)
-  'nba.dlq.ml-scorer-scorer',      # ml-scorer scorer (nba.evaluations)
   'nba.dlq.action-router',         # action-router (nba.evaluations -> CREATE/SUPPRESS)
   'nba.dlq.action-layer',          # action-layer (nba.activations DISPATCH/CANCEL)
   'nba.dlq.temporal-disposition',  # nba-temporal disposition consumer (nba.member.facts)

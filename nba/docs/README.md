@@ -18,13 +18,16 @@ This directory is the authoritative technical documentation. It reflects the sys
 | 07 | [Command Center](07-command-center.md) | The operator UI + BFF, feature-by-feature, with screenshots. |
 | 08 | [Data & medallion lake](08-data-and-lake.md) | The Databricks medallion, normalization, tables, the out/throttle/comms jobs. |
 | 09 | [Infrastructure](09-infrastructure.md) | Containers, networking, the transactional outbox + CDC, boot order, deploy. |
-| 10 | [Scaling & throughput](10-scaling-throughput.md) | Partitioning, predicted throughput, bottlenecks, capacity planning. |
+| 10 | [Scaling & throughput](10-scaling-throughput.md) | Partitioning, the **measured** three-architecture throughput, the Redis RAM wall, capacity planning. |
 | 11 | [ML pipeline](11-ml-pipeline.md) | The learned propensity layer: training, scoring, champion/challenger, simulation, RL. |
+| 12 | [Healthcare NBA redesign](12-healthcare-nba-redesign.md) | The healthcare use-case spec: actions, milestones, the journey, build order. |
+| 13 | [Data stores & schemas](13-data-stores-and-schemas.md) | Every store (Kafka/Redis/Postgres/engine-state/Temporal/Databricks) + its schema, authoritative-vs-derived. |
 | — | [Rules engine deep-dive](rules-engine.md) | How operator JSON becomes live Drools: dynamic DRL synthesis, the definitions topic, eligibility eval. |
 | — | [Hard vs soft completion](hard-soft-completion.md) | The two completion concepts in one page. |
 | — | [ML bundle](../databricks/ml/README.md) | The Databricks ML Asset Bundle (notebooks + jobs) — implementation. |
 | — | [Performance study](../PERFORMANCE.md) | The three-architecture throughput comparison (classic Redis / KStreams RocksDB+IQ / Flink whole-spine), decision-oriented. |
 | — | [Load-test results](../infra/loadtest-results.md) | Raw load-test methodology, runs, and gotchas behind the performance study. |
+| — | [AGENTS runbook](../AGENTS.md) | Operating the stack: one-command bring-up, running the tests, debugging the local infra, the gotchas. |
 
 ## The one-paragraph summary
 

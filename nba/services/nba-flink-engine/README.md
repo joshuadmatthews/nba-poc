@@ -24,7 +24,9 @@ services — no separate JobManager/TaskManager cluster.
 
 The forward path (snapshot→rules→score→route) and the loops (score→facts→snapshot;
 router→statemachine→actionlayer→disposition→statemachine) all flow through the same Kafka topics the live
-system uses, so this is a drop-in-shaped, feature-complete port — same topics, same flow, one runtime.
+system uses, so this is a drop-in-shaped, feature-complete port **on the Kafka topics** — same topics, same
+flow, one runtime. It is **not yet wired for the durable / Databricks path** (it writes Kafka directly, bypassing
+the Postgres outbox → Debezium → lake) — see [Production / Databricks integration gaps](#production--databricks-integration-gaps).
 
 ## The state machine (Temporal replacement) in detail
 `StateMachineFn` is one keyed instance per `(member,action,channel)`. Temporal's durable execution + signals +
@@ -59,6 +61,29 @@ CREATE → CREATED --[debounce timer]--> (suppressed? DEBOUNCED/SUPPRESSED) : DI
   upstream already prevents the sibling race. A full port would add a member-keyed coordinator.
 - **Throttle gate** is SEND (saturated channels are already gated ineligible by the rules engine's THROTTLE_HOT);
   the trickle/backlog bucket is a follow-up.
+
+## Production / Databricks integration — what's actually needed
+This engine reaches **output parity on the Kafka topics** (snapshots, evaluations, scores, router/completion/
+milestone facts, the 11 state facts, activations, dispositions). Importantly, the **Databricks lake and the RL
+scorer read the Kafka topics directly** (`nba_datalake_stream.py` subscribes to `nba.evaluations`/`nba.snapshots`/
+`nba.activations`; `nba_ml_score_rl.py` subscribes to `nba.evaluations`) — they do **not** read the Postgres
+outbox. So in **authoritative** mode the lake and scorer **do see Flink's facts**; the outbox→Debezium is the
+*classic path's transactional emit* mechanism, not a lake dependency. The genuine items before Flink is a true
+prod drop-in:
+- **One writer at a time.** Don't run Temporal **and** authoritative-Flink together — both write the same real
+  topics (dual-write). Pick one as the authoritative writer.
+- **Durability.** The classic path's outbox transactionally couples the business-state write + the Kafka emit.
+  Flink gets the equivalent from its **checkpointed exactly-once Kafka sink** (EXACTLY_ONCE_V2) — so direct writes
+  are durable; the outbox isn't required. (If you specifically want the outbox audit row in Postgres, that'd be
+  an add to `StateMachineFn`/`ActionLayerFn`.)
+- **Scoring — gate the local stage off in prod.** Flink's score stage ports the local deterministic
+  `nba-journey-scorer`. The prod RL scorer (`nba_ml_score_rl`) already subscribes to `nba.evaluations` and emits
+  `nba.score.*`, so for prod you **disable Flink's internal `ScoreStage`** and let the Databricks RL scorer score
+  Flink's evaluations (avoids double-scoring). Config, not a rewrite.
+- **`channel_touch` counter (the one real code gap).** Temporal atomically UPSERTs the per-(member,channel) send
+  counter in Postgres to pick the escalating touch template (`touchKeys[min(n,len-1)]`); `ActionLayerFn` has no
+  Postgres connection, so today every send uses the base `contentKey`. Add a Postgres UPSERT in `ActionLayerFn`
+  (or keep the touch counter in Flink keyed state) to close it.
 
 ## Build / run
 ```
