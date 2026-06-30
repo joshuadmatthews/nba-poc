@@ -242,9 +242,14 @@ Temporal and a keyed-stream job have genuinely different properties for stateful
 - **State evolution / versioning.** Temporal versions and patches *running* workflows; changing the Flink
   state-machine logic is a **job redeploy + savepoint migration** with constrained keyed-state schema evolution — a
   heavier change process for live state.
-- **Reliable external side-effects.** Flink EOS is end-to-end *within the Kafka pipeline*; the actual outbound *send*
-  still needs idempotency. Temporal's **activity model** (retries + timeouts + heartbeats + idempotency keys) is a more
-  natural fit for reliable external calls — with Flink that responsibility shifts to the activation layer / sinks.
+- **Reliable external side-effects — a wash for *this* design (the one "downside" that mostly isn't).** The outbound
+  send is already isolated in the **activation layer** (`ActionLayer` / `ActionLayerFn`: consume `nba.activations` →
+  send → emit the delivery disposition) in **both** flavors, so the send's idempotency was never Temporal's job. What
+  Temporal wraps in classic is only the *emit*: `emitActivation` is a retried activity (5 attempts / 30 s) landing in
+  `outbox_activations`; Flink emits the same activation via an **EOS Kafka sink** — if anything *cleaner* (exactly-once
+  vs the activity's at-least-once + a CDC hop). Temporal's activity model would shine only if the external call were a
+  *synchronous, retried, heartbeated activity* — but we deliberately use the **async activation + disposition** pattern
+  instead, which Flink replicates 1:1. So nothing real shifts here.
 - **Long human-timescale durability.** Temporal is purpose-built for workflows that wait days/weeks durably; Flink
   timers handle TTL-scale waits fine, but very-long-lived per-entity state held in keyed state is heavier.
 
