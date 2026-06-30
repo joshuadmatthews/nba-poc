@@ -229,16 +229,34 @@ action *catalog*, shared by both flavors — Flink reduces the Postgres footprin
 ### The Temporal trade — what Flink gives up
 Temporal and a keyed-stream job have genuinely different properties for stateful work. The honest list:
 
-- **Per-entity control + introspection.** Temporal makes each `(member, action, channel)` an *addressable workflow* —
-  open the Web UI, read its full event history, query live state, and **signal / cancel / reset that one instance**.
-  Flink's state machine is **keyed state**: not individually addressable, no per-workflow timeline, and targeted
-  intervention on a single stuck entity is hard. *Mitigated:* we emit the **same canonical state-transition events**
-  (`nba.actionstate.*`, `nba.activations`, dispositions) regardless of engine, so the Command Center timeline +
-  medallion telemetry give **full visibility into *what* happened** — we lose the interactive per-workflow *control*,
-  not the observability.
-- **Blast radius + recovery granularity.** Temporal isolates failures per workflow and retries activities
-  independently; Flink recovers the **whole job from the last checkpoint**, and a poison key or a bad deploy can
-  **stall the entire spine** — coarser isolation, and scaling means repartitioning the whole job.
+- **Out-of-band per-workflow ops + history UI (not domain control).** The *domain* cancel works on Flink — operator
+  suppress is a first-class event (`StateMachineFn`: `OPERATOR_SUPPRESS` → pre-send `SUPPRESSED`, post-send
+  `SUPPRESSING` → `CANCEL` → `SUPPRESSED`/`SUPPRESS_FAILED`), the **same cascade** as the Temporal workflow. What
+  Temporal adds is the **generic, out-of-band** lever: open the Web UI, read any workflow's full history, query live
+  state, and **terminate / reset an arbitrary stuck instance** for debugging/recovery. Flink's state is **keyed
+  state** — no per-key history browser and no generic reset (you'd emit a domain event or surgically edit a
+  savepoint). *Mitigated:* the same canonical events flow either way, so the Command Center timeline + medallion
+  telemetry give full visibility into *what* happened — the gap is the **debug/recover-one-instance tooling**, not
+  domain control or observability.
+- **Bulk / fleet-wide control — the flip side (here the stream model *wins*).** Suppressing one action across a
+  million members is the *opposite* trade. Classic already does it well — `suppressMatching` fires a **server-side
+  Temporal Batch Operation** (Visibility query `NbaActionId='X' AND ExecutionStatus='Running'` → signal
+  `operatorSuppress`), so one client call fans out across the namespace without enumerating workflows. But it's
+  fundamentally **O(N) durable signals**: each matching workflow receives the signal, appends to its own history, runs
+  a task, and persists — server-throttled, minutes-scale for millions, and it loads the cluster + persistence store.
+  Flink's keyed-state model makes the same fan-out **naturally cheap**: broadcast *one* control record and apply it to
+  every matching keyed entry locally (`applyToKeyedState` over the broadcast that already feeds the ThrottleGate) —
+  memory-speed in each operator, no per-entity round-trip, durability folded into the next checkpoint (one write for
+  all keys). *Honest caveat:* our engine today takes `OPERATOR_SUPPRESS` as a **per-key event** (a naive fleet-suppress
+  would emit N of them — no better), so the broadcast version is a small, natural extension that **isn't wired yet**.
+  It's an *architectural* win latent in the build — but a real one: bulk mutation is where the data-parallel stream
+  model structurally beats per-workflow actors.
+- **Recovery scope (poison is already handled).** Poison records do **not** stall the job — Flink dead-letters them:
+  `ClassifyResolveFn` routes unparseable records to a **DLQ side-output** (`DLQ_TAG` → `nba.dlq`, like the classic
+  builder), and the other operators guard with try/catch. The real difference is *recovery scope*: a genuine job
+  failure (OOM, checkpoint issue) restarts the **whole job from the last checkpoint** — a seconds-scale, all-keys
+  blip — versus Temporal isolating a failure to the one affected workflow. Coarser, but a brief blip, not a poison
+  stall.
 - **State evolution / versioning.** Temporal versions and patches *running* workflows; changing the Flink
   state-machine logic is a **job redeploy + savepoint migration** with constrained keyed-state schema evolution — a
   heavier change process for live state.
@@ -253,11 +271,14 @@ Temporal and a keyed-stream job have genuinely different properties for stateful
 - **Long human-timescale durability.** Temporal is purpose-built for workflows that wait days/weeks durably; Flink
   timers handle TTL-scale waits fine, but very-long-lived per-entity state held in keyed state is heavier.
 
-**Net:** Flink buys consolidation + scale by trading away Temporal's **per-workflow durability, isolation, and
-interactive control**. Because the same events flow either way, **observability stays good** — the real gap is
-*operating on one entity* (replay / cancel / reset it) and the *blast radius* of one big stateful job. For a
-high-throughput, mostly-automated decision loop that's usually a good trade; where you need rich per-instance
-audit/intervention or very-long human-in-the-loop waits, Temporal still earns its keep.
+**Net:** the genuine Flink trade-offs are narrower than they first look — the *domain* operations (suppress = cancel,
+debounce, throttle) and poison-handling (DLQ) are all there, and **bulk / fleet-wide control actually favors the
+stream model** (broadcast fan-out vs O(N) durable signals). What stays in Temporal's column: the **out-of-band
+single-instance tooling** (inspect / reset / terminate one arbitrary workflow + its history UI), **state evolution**
+(a logic change is a job redeploy + savepoint migration vs patching running workflows), and **coarser recovery**
+(whole-job checkpoint restart vs per-workflow isolation). Observability stays good either way (the same events flow).
+For a high-throughput, mostly-automated decision loop that's a good trade; where you need rich single-instance
+debug/intervention or very-long human-in-the-loop waits, Temporal still earns its keep.
 
 ### KStreams, assuming Redis stays the hot path — what it actually buys
 Keep **Redis as the hot-path read cache** (its real strength, §2) and KStreams' own read surface (IQ) goes unused —
@@ -277,7 +298,8 @@ economical Redis RAM.
 | **removes the Temporal start bound?** | no | no | **yes** (state machine in-stream) |
 | **state-machine dynamic state** | Temporal + **Postgres** (`channel_touch` / `nba_inflight`) | Temporal + Postgres (unchanged) | **in-stream keyed state** (no Temporal, no per-dispatch Postgres) |
 | **reliable publish to Kafka** | outbox → **Debezium** CDC | outbox → Debezium (unchanged) | **direct EOS Kafka sink** (no outbox/CDC) |
-| **per-entity control + audit** | Temporal: signal / query / cancel / **reset one workflow** + history UI | Temporal (unchanged) | events only — no per-workflow control (*observability still OK via the shared event stream*) |
+| **single-instance ops** | Temporal: query / **reset / terminate any one workflow** + history UI | Temporal (unchanged) | domain **cancel (suppress) ✓**; no out-of-band reset/terminate or per-key history UI |
+| **bulk / fleet-wide suppress** | Batch Operation — O(N) **durable** signals (server-throttled) | Temporal (unchanged) | **broadcast → keyed-state fan-out** (memory-speed; *latent* — per-key event today) |
 | **RAM wall on the source of truth** | yes (Redis-bound) | **no** (RocksDB) | **no** (disk/heap) |
 | **hot-path reads** | **Redis (fast, always-up)** | Redis (IQ unused) | needs Redis write-through |
 | **earns its complexity for** | nothing — it's the simple default | member-state > economical RAM, Redis kept | **dispatch burst + operational consolidation + RAM wall** |
