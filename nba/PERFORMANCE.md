@@ -193,17 +193,20 @@ Throughput (§1, §6) is the *smallest* of the differences. The real trade is **
 start-rate bound, and what disk-backed state buys when Redis stays the hot path.**
 
 ### Component count — Flink collapses the decision path into one job
-The classic decision path is **six hosted services**: snapshot-builder, rules-engine (Drools), action-router,
-**temporal-worker + the Temporal server** (the state machine), and action-layer. And the state machine doesn't live
-in Temporal alone — it **leans on Postgres** for its dynamic per-member state: the per-(member,channel) **send/touch
-counter** (`channel_touch`, bumped atomically at each dispatch), the **in-flight/dispatch tracker** (`nba_inflight`),
-and the transactional **outbox** (the shared `actionlib` DB). On top sit the shared scorer and the shared infra
-(Redpanda, Redis, the action-library, the BFF). **Flink is ONE job** that wires all of it (`SpineJob`: snapshot →
-rules → score → route → **state-machine → action-layer**). So Flink is *internally* more complex (one large stateful,
-checkpointed job) but **operationally simpler — ~6 processes → 1** — and the headline: **it deletes Temporal** (worker
-+ server; here an embedded DB, in prod a whole frontend/history/matching cluster + its database) *and* folds the
-state machine's Postgres-backed dynamic state into the stream (below). KStreams does **not** consolidate: it adds one
-service (the decision-engine) and
+The classic decision path is **seven hosted services**: snapshot-builder, rules-engine (Drools), action-router,
+**temporal-worker + the Temporal server** (the state machine), action-layer, and a **Debezium / Kafka-Connect** worker
+(`ais-nba-connect`). And the state machine doesn't live in Temporal alone — it leans on **Postgres + Debezium** for
+both its dynamic state and its reliable publishing: the per-(member,channel) **send/touch counter** (`channel_touch`,
+bumped atomically at each dispatch), the **in-flight/dispatch tracker** (`nba_inflight`), and a transactional
+**outbox** (`outbox_*`) that **Debezium CDC-tails into Kafka** (→ `nba.member.facts` / activations / definitions —
+"the loop's spine"). So the classic state-machine + dispatch tier is really **Temporal (server + worker) + Postgres
++ Debezium**. On top sit the shared scorer and the shared infra (Redpanda, Redis, the action-library, the BFF).
+**Flink is ONE job** that wires all of it (`SpineJob`: snapshot → rules → score → route → **state-machine →
+action-layer**). So Flink is *internally* more complex (one large stateful, checkpointed job) but **operationally
+simpler — ~7 processes → 1** — and the headline: **it deletes Temporal** (worker + server; here an embedded DB, in
+prod a whole frontend/history/matching cluster + DB), folds the Postgres-backed dynamic state into the stream, **and
+drops the outbox + Debezium entirely** (Flink writes Kafka directly with exactly-once sinks — see below). KStreams
+does **not** consolidate: it adds one service (the decision-engine) and
 reimplements **only the snapshot stage**, keeping classic's rules, scorer, Temporal and action-layer — net component
 count is essentially unchanged.
 
@@ -216,12 +219,40 @@ competes with live traffic while it drains. Flink's state machine is a **`KeyedP
 to Flink-managed keyed state** — so "dispatch" is keyed state advancing at the **stream rate, partitioned**, with no
 per-workflow-start cost *and no per-dispatch Postgres round-trip*. So Flink doesn't only delete the Temporal
 server/worker — it also retires the **per-member dynamic state** (`nba_inflight` / `channel_touch`) the classic path
-keeps in Postgres, folding dispatch + throttle + send-counts + dedup into one keyed stream. **That is the scale
-unlock: it removes a single-node start bound *and* a per-dispatch database write at once.** (Postgres still backs the
-action *catalog*, shared by both flavors — Flink reduces the Postgres dependency, it doesn't eliminate it.) The cost
-is real and worth stating: one big stateful job means a hot key or a bug can stall the whole spine, scaling means
-repartitioning the entire job, and recovery is one large checkpoint — versus classic's services that scale and fail
-independently.
+keeps in Postgres, folding dispatch + throttle + send-counts + dedup into one keyed stream. And because Flink
+**writes Kafka directly with exactly-once (EOS) sinks**, the stream's transactional sink *is* the reliable publish —
+so it also drops the **outbox → Debezium** tier the classic path needs for that guarantee. **One Flink job retires
+Temporal, the Postgres dynamic state, *and* the Debezium/outbox tier at once — that's the scale unlock: it removes a
+single-node start bound, a per-dispatch database write, and a CDC hop in a single move.** (Postgres still backs the
+action *catalog*, shared by both flavors — Flink reduces the Postgres footprint, it doesn't eliminate it.) This is a real trade, not a free win — see *The Temporal trade* below.
+
+### The Temporal trade — what Flink gives up
+Temporal and a keyed-stream job have genuinely different properties for stateful work. The honest list:
+
+- **Per-entity control + introspection.** Temporal makes each `(member, action, channel)` an *addressable workflow* —
+  open the Web UI, read its full event history, query live state, and **signal / cancel / reset that one instance**.
+  Flink's state machine is **keyed state**: not individually addressable, no per-workflow timeline, and targeted
+  intervention on a single stuck entity is hard. *Mitigated:* we emit the **same canonical state-transition events**
+  (`nba.actionstate.*`, `nba.activations`, dispositions) regardless of engine, so the Command Center timeline +
+  medallion telemetry give **full visibility into *what* happened** — we lose the interactive per-workflow *control*,
+  not the observability.
+- **Blast radius + recovery granularity.** Temporal isolates failures per workflow and retries activities
+  independently; Flink recovers the **whole job from the last checkpoint**, and a poison key or a bad deploy can
+  **stall the entire spine** — coarser isolation, and scaling means repartitioning the whole job.
+- **State evolution / versioning.** Temporal versions and patches *running* workflows; changing the Flink
+  state-machine logic is a **job redeploy + savepoint migration** with constrained keyed-state schema evolution — a
+  heavier change process for live state.
+- **Reliable external side-effects.** Flink EOS is end-to-end *within the Kafka pipeline*; the actual outbound *send*
+  still needs idempotency. Temporal's **activity model** (retries + timeouts + heartbeats + idempotency keys) is a more
+  natural fit for reliable external calls — with Flink that responsibility shifts to the activation layer / sinks.
+- **Long human-timescale durability.** Temporal is purpose-built for workflows that wait days/weeks durably; Flink
+  timers handle TTL-scale waits fine, but very-long-lived per-entity state held in keyed state is heavier.
+
+**Net:** Flink buys consolidation + scale by trading away Temporal's **per-workflow durability, isolation, and
+interactive control**. Because the same events flow either way, **observability stays good** — the real gap is
+*operating on one entity* (replay / cancel / reset it) and the *blast radius* of one big stateful job. For a
+high-throughput, mostly-automated decision loop that's usually a good trade; where you need rich per-instance
+audit/intervention or very-long human-in-the-loop waits, Temporal still earns its keep.
 
 ### KStreams, assuming Redis stays the hot path — what it actually buys
 Keep **Redis as the hot-path read cache** (its real strength, §2) and KStreams' own read surface (IQ) goes unused —
@@ -237,16 +268,20 @@ economical Redis RAM.
 ### The honest scorecard
 | | classic | KStreams | Flink |
 |---|---|---|---|
-| **decision-path processes** | ~6 (incl. Temporal worker + server) | ~6 (swaps the snapshot store) | **1 job, no Temporal** |
+| **decision-path processes** | ~7 (incl. Temporal worker + server, Debezium) | ~7 (swaps the snapshot store) | **1 job, no Temporal** |
 | **removes the Temporal start bound?** | no | no | **yes** (state machine in-stream) |
 | **state-machine dynamic state** | Temporal + **Postgres** (`channel_touch` / `nba_inflight`) | Temporal + Postgres (unchanged) | **in-stream keyed state** (no Temporal, no per-dispatch Postgres) |
+| **reliable publish to Kafka** | outbox → **Debezium** CDC | outbox → Debezium (unchanged) | **direct EOS Kafka sink** (no outbox/CDC) |
+| **per-entity control + audit** | Temporal: signal / query / cancel / **reset one workflow** + history UI | Temporal (unchanged) | events only — no per-workflow control (*observability still OK via the shared event stream*) |
 | **RAM wall on the source of truth** | yes (Redis-bound) | **no** (RocksDB) | **no** (disk/heap) |
 | **hot-path reads** | **Redis (fast, always-up)** | Redis (IQ unused) | needs Redis write-through |
 | **earns its complexity for** | nothing — it's the simple default | member-state > economical RAM, Redis kept | **dispatch burst + operational consolidation + RAM wall** |
 
 **Bottom line.** KStreams earns its keep **only** as a state-size play — disk-backed authoritative state behind a
 Redis hot cache; it leaves the dispatch bound and the component count untouched. **Flink earns the most**: it is the
-one flavor that both **shrinks the operational footprint** (≈6 processes → 1) and **removes a hard scale bound**
-(Temporal's ~178/s start path). So when the RAM / burst / dispatch math finally binds, the bigger lever is **Flink,
-not KStreams** — it attacks the dispatch ceiling and the service sprawl at once, with Redis retained purely as the
-fast hot-read cache.
+one flavor that both **shrinks the operational footprint** (≈7 processes → 1, dropping Temporal + the Postgres dynamic
+state + the Debezium/outbox tier) and **removes a hard scale bound** (Temporal's ~178/s start path). The trade is
+real — you give up Temporal's **per-workflow durability, isolation, and interactive control** (*The Temporal trade*
+above) — but because the same canonical events flow either way, **observability stays good**. So when the RAM / burst
+/ dispatch math binds, the bigger lever is **Flink, not KStreams** — it attacks the dispatch ceiling and the service
+sprawl at once, with Redis retained purely as the fast hot-read cache.
