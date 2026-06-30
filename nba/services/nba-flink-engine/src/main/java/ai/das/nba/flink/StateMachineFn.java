@@ -10,6 +10,7 @@ import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.runtime.state.KeyedStateFunction;
 import org.apache.flink.streaming.api.functions.co.KeyedBroadcastProcessFunction;
 import org.apache.flink.util.Collector;
 import org.apache.flink.util.OutputTag;
@@ -36,6 +37,10 @@ public class StateMachineFn extends KeyedBroadcastProcessFunction<String, StateE
     public static final MapStateDescriptor<String, String> DEFS_DESC =
             new MapStateDescriptor<>("sm-definitions", Types.STRING, Types.STRING);
     private static final Set<String> TERMINAL = Set.of("FAILED", "SUPPRESSED", "HARD_COMPLETED", "EXPIRED", "DEBOUNCED");
+    /** Hoisted (not inlined in open) so the broadcast handler can fan a fleet-wide suppress across ALL keyed
+     *  instances via {@code applyToKeyedState} — the Flink analog of Temporal's suppressMatching Batch Operation. */
+    private static final ValueStateDescriptor<SmState> STATE_DESC =
+            new ValueStateDescriptor<>("sm", TypeInformation.of(SmState.class));
 
     private final long debounceMs;
     private final long throttleRecheckMs;
@@ -49,7 +54,7 @@ public class StateMachineFn extends KeyedBroadcastProcessFunction<String, StateE
 
     @Override
     public void open(Configuration p) {
-        state = getRuntimeContext().getState(new ValueStateDescriptor<>("sm", TypeInformation.of(SmState.class)));
+        state = getRuntimeContext().getState(STATE_DESC);
         throttle = new ThrottleGate();
     }
 
@@ -57,16 +62,62 @@ public class StateMachineFn extends KeyedBroadcastProcessFunction<String, StateE
     @Override
     public void processBroadcastElement(FactRecord def, Context ctx, Collector<KafkaOut> out) throws Exception {
         if (def.key == null) return;
+        int i = def.key.indexOf(':');
+        String type = i < 0 ? def.key : def.key.substring(0, i);
+        // Fleet-wide operator suppress: a single broadcast command, fanned out across ALL matching keyed instances
+        // (the suppressMatching analog). One-shot command, so it is NOT stored in the definitions broadcast state.
+        if ("OPSUPPRESS".equals(type)) { fleetSuppress(def.value, ctx, out); return; }
         var st = ctx.getBroadcastState(DEFS_DESC);
         if (def.value == null || def.value.isEmpty()) { st.remove(def.key); return; }
         st.put(def.key, def.value);
-        int i = def.key.indexOf(':'); if (i < 0) return;
-        String type = def.key.substring(0, i), id = def.key.substring(i + 1);
+        if (i < 0) return;
+        String id = def.key.substring(i + 1);
         try {
             JsonNode v = SnapshotLogic.M.readTree(def.value);
             if ("THROTTLE".equals(type)) throttle.onFact(v);
             else if ("CHANNEL_RULE".equals(type)) throttle.onChannelRule(id, v, false);
         } catch (Exception ignore) { /* skip bad def */ }
+    }
+
+    /** Fan ONE operator-suppress command across every matching LIVE keyed instance via {@code applyToKeyedState} —
+     *  the Flink analog of Temporal's suppressMatching Batch Operation, but a local memory-speed keyed-state scan
+     *  instead of O(N) durable per-workflow signals. The per-key transition mirrors the OPERATOR_SUPPRESS branch in
+     *  {@link #processElement} exactly: pre-send (DEBOUNCE/THROTTLE) instances go terminal SUPPRESSED; post-send
+     *  (TRACKING) instances emit SUPPRESSING + a CANCEL activation (the activation layer then replies with a
+     *  SUPPRESSED/SUPPRESS_FAILED disposition, just like the per-key path). Idempotent — already terminal/cleared
+     *  keys are skipped, so re-broadcasting the same command emits nothing new. value = {"actionId", "channel"?}
+     *  (empty/absent channel = all channels for the action). */
+    private void fleetSuppress(String value, Context ctx, Collector<KafkaOut> out) throws Exception {
+        final String actionId, channel;
+        try {
+            JsonNode v = SnapshotLogic.M.readTree(value);
+            actionId = v.path("actionId").asText("");
+            channel  = v.path("channel").asText("");
+        } catch (Exception e) { return; }
+        if (actionId.isEmpty()) return;
+        final long now = ctx.currentProcessingTime();
+        final java.util.List<KafkaOut> facts = new java.util.ArrayList<>();
+        final java.util.List<KafkaOut> cancels = new java.util.ArrayList<>();
+        ctx.applyToKeyedState(STATE_DESC, (KeyedStateFunction<String, ValueState<SmState>>) (key, vs) -> {
+            SmState st = vs.value();
+            if (st == null || "DONE".equals(st.phase)) return;
+            if (!actionId.equals(st.actionId)) return;
+            if (!channel.isEmpty() && !channel.equals(st.channel)) return;
+            if ("DEBOUNCE".equals(st.phase) || "THROTTLE".equals(st.phase)) {          // pre-send -> terminal now
+                if (st.inBacklog) { throttle.exitBacklog(st.channel); st.inBacklog = false; }
+                st.currentState = "SUPPRESSED";
+                facts.add(KafkaOut.of(st.memberKey(), stateFact(st, "SUPPRESSED", now, null), "state"));
+                vs.clear();                                                            // dangling timers no-op on null state
+            } else if ("TRACKING".equals(st.phase) && !st.cancelSent) {               // post-send -> ask the layer to cancel
+                st.cancelSent = true;
+                st.currentState = "SUPPRESSING";
+                facts.add(KafkaOut.of(st.memberKey(), stateFact(st, "SUPPRESSING", now, null), "state"));
+                cancels.add(activationKafka(st, activationNode(st, "CANCEL", now)));
+                vs.update(st);
+            }
+        });
+        for (KafkaOut f : facts) out.collect(f);
+        for (KafkaOut c : cancels) ctx.output(ACT_TAG, c);
     }
 
     @Override
@@ -179,12 +230,7 @@ public class StateMachineFn extends KeyedBroadcastProcessFunction<String, StateE
     }
 
     private void emitActivation(SmState st, String op, ReadOnlyContext ctx) {
-        ObjectNode a = SnapshotLogic.M.createObjectNode();
-        a.put("op", op); a.put("nbaId", st.nbaId); a.put("entityType", st.entityType); a.put("entityId", st.entityId);
-        a.put("memberId", st.entityId); a.put("actionId", st.actionId); a.put("channel", st.channel);
-        a.put("contentKey", st.contentKey); a.put("ttlSeconds", st.ttlSeconds); a.put("trackingId", st.trackingId());
-        a.put("correlationId", st.correlationId); a.put("source", "state-machine");
-        a.put("eventTs", ctx.timerService().currentProcessingTime());
+        ObjectNode a = activationNode(st, op, ctx.timerService().currentProcessingTime());
         // On the SEND: carry the dispatched action's per-touch templates (channels[].touchKeys) so the downstream
         // TouchFn can pick touchKeys[min(n,len)-1] for the monotonic (nbaId,channel) send count. Absent/empty -> the
         // base contentKey stands. CANCEL doesn't send, so no touchKeys.
@@ -192,8 +238,24 @@ public class StateMachineFn extends KeyedBroadcastProcessFunction<String, StateE
             ArrayNode tk = touchKeysFor(ctx, st.actionId, st.channel);
             if (tk != null && tk.size() > 0) a.set("touchKeys", tk);
         }
-        try { ctx.output(ACT_TAG, KafkaOut.of(st.nbaId + ":" + st.actionId + ":" + st.channel, SnapshotLogic.M.writeValueAsString(a), null)); }
-        catch (Exception ignore) {}
+        ctx.output(ACT_TAG, activationKafka(st, a));
+    }
+
+    /** The activation JSON (DISPATCH/CANCEL) minus the per-touch templates. Timestamp explicit so it builds from
+     *  both {@link #processElement} (timer time) and the broadcast handler ({@code ctx.currentProcessingTime}). */
+    private static ObjectNode activationNode(SmState st, String op, long now) {
+        ObjectNode a = SnapshotLogic.M.createObjectNode();
+        a.put("op", op); a.put("nbaId", st.nbaId); a.put("entityType", st.entityType); a.put("entityId", st.entityId);
+        a.put("memberId", st.entityId); a.put("actionId", st.actionId); a.put("channel", st.channel);
+        a.put("contentKey", st.contentKey); a.put("ttlSeconds", st.ttlSeconds); a.put("trackingId", st.trackingId());
+        a.put("correlationId", st.correlationId); a.put("source", "state-machine"); a.put("eventTs", now);
+        return a;
+    }
+
+    private static KafkaOut activationKafka(SmState st, ObjectNode a) {
+        String k = st.nbaId + ":" + st.actionId + ":" + st.channel;
+        try { return KafkaOut.of(k, SnapshotLogic.M.writeValueAsString(a), null); }
+        catch (Exception e) { return KafkaOut.of(k, "{}", null); }
     }
 
     /** The dispatched action's channels[].touchKeys for this channel, from the broadcast ACTION def — or null. */

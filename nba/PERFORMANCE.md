@@ -247,10 +247,15 @@ Temporal and a keyed-stream job have genuinely different properties for stateful
   Flink's keyed-state model makes the same fan-out **naturally cheap**: broadcast *one* control record and apply it to
   every matching keyed entry locally (`applyToKeyedState` over the broadcast that already feeds the ThrottleGate) —
   memory-speed in each operator, no per-entity round-trip, durability folded into the next checkpoint (one write for
-  all keys). *Honest caveat:* our engine today takes `OPERATOR_SUPPRESS` as a **per-key event** (a naive fleet-suppress
-  would emit N of them — no better), so the broadcast version is a small, natural extension that **isn't wired yet**.
-  It's an *architectural* win latent in the build — but a real one: bulk mutation is where the data-parallel stream
-  model structurally beats per-workflow actors.
+  all keys). *Status — now real, not just latent:* the broadcast fan-out is **implemented and tested** in the engine.
+  `StateMachineFn` handles an `OPSUPPRESS` broadcast command and applies it across every matching keyed instance via
+  `applyToKeyedState` (pre-send → terminal `SUPPRESSED`; post-send → `SUPPRESSING` + a `CANCEL` activation, then the
+  layer's disposition drains it — the same cascade as the per-key path). Harness tests cover the fan-out, action- and
+  channel-scoping, idempotency, and a **1,000-action in-process queue cancelled by one broadcast and drained to
+  `SUPPRESSED`**. What's still unwired is only the *producer* — an operator action publishing the `OPSUPPRESS` record
+  onto the definitions stream (classic already has `suppressMatching`). So it's a real engine capability behind a thin
+  operator-API gap, not a paper one: bulk mutation is where the data-parallel stream model structurally beats
+  per-workflow actors.
 - **Recovery scope (poison is already handled).** Poison records do **not** stall the job — Flink dead-letters them:
   `ClassifyResolveFn` routes unparseable records to a **DLQ side-output** (`DLQ_TAG` → `nba.dlq`, like the classic
   builder), and the other operators guard with try/catch. The real difference is *recovery scope*: a genuine job
@@ -299,7 +304,7 @@ economical Redis RAM.
 | **state-machine dynamic state** | Temporal + **Postgres** (`channel_touch` / `nba_inflight`) | Temporal + Postgres (unchanged) | **in-stream keyed state** (no Temporal, no per-dispatch Postgres) |
 | **reliable publish to Kafka** | outbox → **Debezium** CDC | outbox → Debezium (unchanged) | **direct EOS Kafka sink** (no outbox/CDC) |
 | **single-instance ops** | Temporal: query / **reset / terminate any one workflow** + history UI | Temporal (unchanged) | domain **cancel (suppress) ✓**; no out-of-band reset/terminate or per-key history UI |
-| **bulk / fleet-wide suppress** | Batch Operation — O(N) **durable** signals (server-throttled) | Temporal (unchanged) | **broadcast → keyed-state fan-out** (memory-speed; *latent* — per-key event today) |
+| **bulk / fleet-wide suppress** | Batch Operation — O(N) **durable** signals (server-throttled) | Temporal (unchanged) | **broadcast → keyed-state fan-out** (memory-speed; engine done + tested, producer-API unwired) |
 | **RAM wall on the source of truth** | yes (Redis-bound) | **no** (RocksDB) | **no** (disk/heap) |
 | **hot-path reads** | **Redis (fast, always-up)** | Redis (IQ unused) | needs Redis write-through |
 | **earns its complexity for** | nothing — it's the simple default | member-state > economical RAM, Redis kept | **dispatch burst + operational consolidation + RAM wall** |
