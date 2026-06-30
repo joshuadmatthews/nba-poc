@@ -12,6 +12,7 @@ public class Conf implements Serializable {
     public String bootstrap;
     public String group;
     public boolean authoritative;
+    public boolean scoreEnabled;
     public int parallelism;
     public long checkpointMs;
     public String redisHost;
@@ -30,6 +31,10 @@ public class Conf implements Serializable {
         c.bootstrap = env("NBA_BOOTSTRAP", "nba-redpanda:9092");
         c.group = env("NBA_FLINK_GROUP", "nba-flink-engine");
         c.authoritative = "authoritative".equalsIgnoreCase(env("NBA_FLINK_MODE", "shadow"));
+        // Internal score stage: ON by default (local is self-contained). Turn OFF in prod so the Databricks RL
+        // scorer (nba_ml_score_rl, already subscribed to nba.evaluations) is the sole writer of nba.score.* —
+        // its scores fold back through the snapshot via nba.member.facts (avoids double-scoring).
+        c.scoreEnabled = !"off".equalsIgnoreCase(env("NBA_FLINK_SCORE", "on"));
         c.parallelism = Integer.parseInt(env("NBA_FLINK_PARALLELISM", "1"));
         c.checkpointMs = Long.parseLong(env("NBA_FLINK_CHECKPOINT_MS", "10000"));
         c.redisHost = env("NBA_REDIS_HOST", "nba-redis");

@@ -1,8 +1,10 @@
 package ai.das.nba.flink;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.apache.flink.api.common.state.MapStateDescriptor;
+import org.apache.flink.api.common.state.ReadOnlyBroadcastState;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
@@ -183,8 +185,32 @@ public class StateMachineFn extends KeyedBroadcastProcessFunction<String, StateE
         a.put("contentKey", st.contentKey); a.put("ttlSeconds", st.ttlSeconds); a.put("trackingId", st.trackingId());
         a.put("correlationId", st.correlationId); a.put("source", "state-machine");
         a.put("eventTs", ctx.timerService().currentProcessingTime());
+        // On the SEND: carry the dispatched action's per-touch templates (channels[].touchKeys) so the downstream
+        // TouchFn can pick touchKeys[min(n,len)-1] for the monotonic (nbaId,channel) send count. Absent/empty -> the
+        // base contentKey stands. CANCEL doesn't send, so no touchKeys.
+        if ("DISPATCH".equals(op)) {
+            ArrayNode tk = touchKeysFor(ctx, st.actionId, st.channel);
+            if (tk != null && tk.size() > 0) a.set("touchKeys", tk);
+        }
         try { ctx.output(ACT_TAG, KafkaOut.of(st.nbaId + ":" + st.actionId + ":" + st.channel, SnapshotLogic.M.writeValueAsString(a), null)); }
         catch (Exception ignore) {}
+    }
+
+    /** The dispatched action's channels[].touchKeys for this channel, from the broadcast ACTION def — or null. */
+    private static ArrayNode touchKeysFor(ReadOnlyContext ctx, String actionId, String channel) {
+        try {
+            ReadOnlyBroadcastState<String, String> defs = ctx.getBroadcastState(DEFS_DESC);
+            String json = defs.get("ACTION:" + actionId);
+            if (json == null) return null;
+            JsonNode def = SnapshotLogic.M.readTree(json);
+            for (JsonNode ch : def.path("channels")) {
+                if (!channel.equals(ch.path("channel").asText())) continue;
+                JsonNode tk = ch.get("touchKeys");
+                if (tk != null && tk.isArray() && tk.size() > 0) return (ArrayNode) tk;
+                return null;                                    // channel found, no touchKeys -> base contentKey
+            }
+        } catch (Exception ignore) { /* missing/bad def -> base contentKey */ }
+        return null;
     }
 
     private static String stateFact(SmState st, String stateName, long now, String reason) {

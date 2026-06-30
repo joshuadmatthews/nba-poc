@@ -37,8 +37,9 @@ public class NbaFlinkApp {
         env.setParallelism(cfg.parallelism);
         env.enableCheckpointing(cfg.checkpointMs);   // exactly-once state + (with the EOS sink) end-to-end EOS
 
-        log.info("NBA Flink engine starting mode={} bootstrap={} parallelism={}",
-                cfg.authoritative ? "AUTHORITATIVE" : "shadow", cfg.bootstrap, cfg.parallelism);
+        log.info("NBA Flink engine starting mode={} score={} bootstrap={} parallelism={}",
+                cfg.authoritative ? "AUTHORITATIVE" : "shadow", cfg.scoreEnabled ? "on" : "off (Databricks RL)",
+                cfg.bootstrap, cfg.parallelism);
 
         SpineJob.build(env, cfg);
 

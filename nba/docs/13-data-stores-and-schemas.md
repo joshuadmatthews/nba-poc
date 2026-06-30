@@ -121,9 +121,9 @@ point — see [PERFORMANCE.md](../PERFORMANCE.md)).
   **Note (prod/Databricks):** the Flink job writes Kafka **directly** (exactly-once checkpointed sinks), not
   through the Postgres outbox — but the lake + RL scorer **read the Kafka topics**, so they still see Flink's
   facts in authoritative mode (the outbox is the classic path's transactional emit, not a lake dependency). The
-  real prod items are small: one authoritative writer at a time, gate Flink's local score stage off in favor of
-  the Databricks RL scorer, and add the `channel_touch` counter. See
-  [`services/nba-flink-engine/README.md`](../services/nba-flink-engine/README.md).
+  score-gate (`NBA_FLINK_SCORE=off`, hands scoring to the Databricks RL job) and the `channel_touch` counter
+  (Flink keyed state) are now **implemented**; the only remaining item is operational — one authoritative writer
+  at a time (Temporal xor Flink). See [`services/nba-flink-engine/README.md`](../services/nba-flink-engine/README.md).
 
 ---
 

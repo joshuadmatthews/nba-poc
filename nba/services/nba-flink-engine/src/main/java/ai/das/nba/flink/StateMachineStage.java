@@ -14,7 +14,8 @@ import static ai.das.nba.flink.NbaFlinkApp.sourceStream;
  *   member.facts(kind=router|disposition) -> StateEventMapper
  *     -> [member-keyed] MemberDedupFn (debounceLost; DEBOUNCED losers to member.facts)
  *     -> [(member,action,channel)-keyed] StateMachineFn + broadcast(nba.definitions for the ThrottleGate)
- *        -> state facts (member.facts, kind=state) + DISPATCH/CANCEL (nba.activations).
+ *        -> state facts (member.facts, kind=state) + DISPATCH/CANCEL (ACT side-output)
+ *     -> [(nbaId,channel)-keyed] TouchFn (the channel_touch counter -> escalating touchKeys) -> nba.activations.
  */
 final class StateMachineStage {
     private StateMachineStage() {}
@@ -39,6 +40,14 @@ final class StateMachineStage {
                 .process(new StateMachineFn(cfg.debounceSeconds, cfg.throttleRecheckSeconds))
                 .name("state-machine");
         sinkTo(states, cfg, cfg.sink(cfg.memberFacts), "sink-states");
-        sinkTo(states.getSideOutput(StateMachineFn.ACT_TAG), cfg, cfg.sink(cfg.activations), "sink-activations");
+
+        // channel_touch: re-key the DISPATCH/CANCEL activations by (nbaId,channel) and run the monotonic touch
+        // counter (TouchFn) BEFORE the activations sink, so both the Kafka topic AND the ActionLayerFn (which
+        // reads that topic) see the escalated contentKey. Replaces Temporal's Postgres channel_touch UPSERT.
+        SingleOutputStreamOperator<KafkaOut> activations = states.getSideOutput(StateMachineFn.ACT_TAG)
+                .keyBy((KeySelector<KafkaOut, String>) TouchFn::touchKey)
+                .process(new TouchFn())
+                .name("channel-touch");
+        sinkTo(activations, cfg, cfg.sink(cfg.activations), "sink-activations");
     }
 }

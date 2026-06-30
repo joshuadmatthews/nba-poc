@@ -24,9 +24,11 @@ services — no separate JobManager/TaskManager cluster.
 
 The forward path (snapshot→rules→score→route) and the loops (score→facts→snapshot;
 router→statemachine→actionlayer→disposition→statemachine) all flow through the same Kafka topics the live
-system uses, so this is a drop-in-shaped, feature-complete port **on the Kafka topics** — same topics, same
-flow, one runtime. It is **not yet wired for the durable / Databricks path** (it writes Kafka directly, bypassing
-the Postgres outbox → Debezium → lake) — see [Production / Databricks integration gaps](#production--databricks-integration-gaps).
+system uses, so this is a feature-complete drop-in on the Kafka topics — same topics, same flow, one runtime.
+The Databricks lake + RL scorer read these topics directly, so **authoritative mode integrates with Databricks**;
+the prod items (the score-gate and the `channel_touch` counter) are now **implemented** — see
+[Production / Databricks integration](#production--databricks-integration--whats-actually-needed). The only
+remaining caveat is operational: run **one** authoritative writer at a time (Temporal *xor* Flink).
 
 ## The state machine (Temporal replacement) in detail
 `StateMachineFn` is one keyed instance per `(member,action,channel)`. Temporal's durable execution + signals +
@@ -48,6 +50,11 @@ CREATE → CREATED --[debounce timer]--> (suppressed? DEBOUNCED/SUPPRESSED) : DI
   the shadow pipeline is self-contained and fed by live facts, with zero blast radius on the classic system.
 - `NBA_FLINK_MODE=authoritative` — writes the real topics + the Redis mirrors (`nba:snapshot`, `nba:eligibility`)
   so the synchronous hot path (action-library) and downstream stay byte-compatible; the Flink job becomes the writer.
+- `NBA_FLINK_SCORE=on` (default) | `off` — `off` SKIPS Flink's internal `ScoreStage` so no `nba.score.*` facts are
+  produced by Flink; the Databricks RL scorer (`nba_ml_score_rl`, already subscribed to `nba.evaluations`) becomes
+  the sole writer of `nba.score.*`, whose scores fold back through the snapshot via `nba.member.facts`. Use `off`
+  in prod to avoid double-scoring; the rest of the graph is unchanged (evaluations still flow to the router; scores
+  arrive via the snapshot). `pwsh run.ps1 -Score off`.
 
 ## Faithful where it counts; simplifications (noted, not hidden)
 - **Eligibility is evaluated in Java** (`RulesLogic.treePass`/`condPass`) — the *same condition-tree semantics*
@@ -68,22 +75,25 @@ milestone facts, the 11 state facts, activations, dispositions). Importantly, th
 scorer read the Kafka topics directly** (`nba_datalake_stream.py` subscribes to `nba.evaluations`/`nba.snapshots`/
 `nba.activations`; `nba_ml_score_rl.py` subscribes to `nba.evaluations`) — they do **not** read the Postgres
 outbox. So in **authoritative** mode the lake and scorer **do see Flink's facts**; the outbox→Debezium is the
-*classic path's transactional emit* mechanism, not a lake dependency. The genuine items before Flink is a true
-prod drop-in:
-- **One writer at a time.** Don't run Temporal **and** authoritative-Flink together — both write the same real
-  topics (dual-write). Pick one as the authoritative writer.
+*classic path's transactional emit* mechanism, not a lake dependency. The score-gate and `channel_touch` items
+below are now **implemented**; the remaining genuine item before Flink is a true prod drop-in is operational:
+- **One writer at a time (operational note).** Don't run Temporal **and** authoritative-Flink together — both write
+  the same real topics (dual-write). Pick one as the authoritative writer.
 - **Durability.** The classic path's outbox transactionally couples the business-state write + the Kafka emit.
   Flink gets the equivalent from its **checkpointed exactly-once Kafka sink** (EXACTLY_ONCE_V2) — so direct writes
   are durable; the outbox isn't required. (If you specifically want the outbox audit row in Postgres, that'd be
   an add to `StateMachineFn`/`ActionLayerFn`.)
-- **Scoring — gate the local stage off in prod.** Flink's score stage ports the local deterministic
-  `nba-journey-scorer`. The prod RL scorer (`nba_ml_score_rl`) already subscribes to `nba.evaluations` and emits
-  `nba.score.*`, so for prod you **disable Flink's internal `ScoreStage`** and let the Databricks RL scorer score
-  Flink's evaluations (avoids double-scoring). Config, not a rewrite.
-- **`channel_touch` counter (the one real code gap).** Temporal atomically UPSERTs the per-(member,channel) send
-  counter in Postgres to pick the escalating touch template (`touchKeys[min(n,len-1)]`); `ActionLayerFn` has no
-  Postgres connection, so today every send uses the base `contentKey`. Add a Postgres UPSERT in `ActionLayerFn`
-  (or keep the touch counter in Flink keyed state) to close it.
+- **Scoring — gate the local stage off in prod. DONE.** Flink's score stage ports the local deterministic
+  `nba-journey-scorer`. Set **`NBA_FLINK_SCORE=off`** (`-Score off`) to SKIP Flink's internal `ScoreStage` so the
+  prod RL scorer (`nba_ml_score_rl`, already subscribed to `nba.evaluations`) is the sole writer of `nba.score.*`;
+  its scores fold back through the snapshot via `nba.member.facts` (avoids double-scoring). Config, not a rewrite.
+- **`channel_touch` counter. DONE — in Flink keyed state, no Postgres.** Temporal atomically UPSERTs the
+  per-(member,channel) send counter in Postgres to pick the escalating touch template (`touchKeys[min(n,len)-1]`).
+  Flink now does this in `TouchFn` (a `KeyedProcessFunction` keyed by `nbaId:channel`, `ValueState<Long>` count),
+  wired on the activation stream between `StateMachineFn`'s DISPATCH side-output and the activations sink — so both
+  the Kafka topic and `ActionLayerFn` see the escalated `contentKey`. `StateMachineFn` carries the dispatched
+  action's `channels[].touchKeys` on the DISPATCH activation (read from the broadcast ACTION def); a send with no
+  touchKeys keeps the base `contentKey`. Self-contained in Flink state — no JDBC.
 
 ## Build / run
 ```
@@ -92,4 +102,5 @@ pwsh run.ps1                                                           # deploy 
 ```
 Tests: `SnapshotLogicTest` (classify + LWW), `RulesLogicTest` (condPass/treePass/eligibleHits/evaluate +
 change-detect), `ScoreFnTest` (scoring), `StateMachineFnTest` (the lifecycle via the Flink test harness:
-debounce→dispatch→hard-complete, TTL→expire, pre-send suppress→debounced).
+debounce→dispatch→hard-complete, TTL→expire, pre-send suppress→debounced), `TouchFnTest` (the `channel_touch`
+counter: 1st send→touchKeys[0], 2nd→[1], capped at the last, per-channel; no touchKeys→base contentKey).

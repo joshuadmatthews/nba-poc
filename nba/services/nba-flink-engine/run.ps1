@@ -3,10 +3,13 @@
   Build + (re)run the NBA Flink engine — the whole NBA spine (snapshot/rules/score/route + the lifecycle state
   machine that replaces Temporal) as one embedded Apache Flink job. Third reference impl. Additive + mode-gated:
   shadow (default) writes .shadow topics and drives nothing; authoritative writes the real topics + Redis mirrors.
+  -Score on|off (default on; NBA_FLINK_SCORE) — off skips Flink's internal score stage so the Databricks RL
+  scorer (nba_ml_score_rl) is the sole writer of nba.score.* in prod (its scores fold back via nba.member.facts).
   POC container, safe to recreate.
 #>
 [CmdletBinding()]
-param([switch]$Build, [ValidateSet('shadow','authoritative')][string]$Mode = 'shadow', [int]$Parallelism = 1)
+param([switch]$Build, [ValidateSet('shadow','authoritative')][string]$Mode = 'shadow',
+      [ValidateSet('on','off')][string]$Score = 'on', [int]$Parallelism = 1)
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 $NAME = 'ais-nba-flink-engine'
@@ -30,6 +33,7 @@ $ARGS = @(
   '-e', 'NBA_BOOTSTRAP=nba-redpanda:9092',
   '-e', 'NBA_REDIS_HOST=nba-redis',
   '-e', "NBA_FLINK_MODE=$Mode",
+  '-e', "NBA_FLINK_SCORE=$Score",
   '-e', "NBA_FLINK_PARALLELISM=$Parallelism",
   $IMG
 )

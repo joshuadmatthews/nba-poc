@@ -14,7 +14,7 @@ final class SpineJob {
     static void build(StreamExecutionEnvironment env, Conf cfg) {
         stageSnapshot(env, cfg);
         stageRules(env, cfg);
-        stageScore(env, cfg);
+        if (cfg.scoreEnabled) stageScore(env, cfg);   // OFF in prod: the Databricks RL scorer owns nba.score.*
         stageRoute(env, cfg);
         stageStateMachine(env, cfg);
         stageActionLayer(env, cfg);
@@ -42,7 +42,7 @@ final class SpineJob {
     /** STAGE 2 — RULES/ELIGIBILITY (filled in RulesStage). */
     static void stageRules(StreamExecutionEnvironment env, Conf cfg) { RulesStage.wire(env, cfg); }
 
-    /** STAGE 3 — SCORE (filled in ScoreStage). */
+    /** STAGE 3 — SCORE (filled in ScoreStage). Skipped when NBA_FLINK_SCORE=off (prod: Databricks RL scorer scores). */
     static void stageScore(StreamExecutionEnvironment env, Conf cfg) { ScoreStage.wire(env, cfg); }
 
     /** STAGE 4 — ROUTE (filled in RouteStage). */
