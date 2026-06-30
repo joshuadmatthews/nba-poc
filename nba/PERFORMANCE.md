@@ -311,10 +311,17 @@ gap **favors Temporal in the framing** and is still three-plus orders of magnitu
 more history shards/nodes; Flink: more parallel sub-tasks, each fanning out its key-partition), so the asymmetry —
 in-memory keyed-state scan vs N durable signals — holds at equal parallelism.
 
-*Grounding (live):* the running classic stack currently holds **71,172 in-flight `ChannelActionWorkflow`s**
-(~6–7k per action-channel). Suppressing one action across its channels (`action_reengage`, ≈24.7k running) projects
-to **~140 s on Temporal vs ~0.15 s on Flink**. A live stopwatch run (which cancels that slice's in-flight workflows)
-is available on request rather than run unprompted.
+*Grounding — live-measured on the running classic stack (71,172 in-flight `ChannelActionWorkflow`s).* Firing the
+**real Temporal Batch Operation** — `operatorSuppress` signalled over the `NbaActionId='action_reengage' AND
+NbaChannel='push' AND ExecutionStatus='Running'` Visibility query, exactly what `suppressMatching` issues — against
+**6,753** running workflows, the batch completed **~3,000 signals in ~3 min (≈17/s)** before throttle/worker-bound
+stalling. That's *below* the §3 ~178/s server bound because Temporal's Batch Operation is deliberately RPS-throttled
+to protect the cluster (configurable). At the measured ~17/s a 1M-instance suppress is **~16 h**; even at the generous
+~178/s bound it's ~1.6 h — versus Flink's **4.7 s**. Two honest caveats from the live run: (1) the `POST /suppress`
+*trigger* (outbox → Debezium → the temporal bridge that starts the `SuppressionWorkflow`) was lagging, so I invoked
+the identical Batch Operation directly to measure the *mechanism*; (2) post-send workflows don't leave `Running` on
+suppress — they emit a CANCEL and await the cancel disposition/TTL — so the wall-clock to fully *drain* exceeds even
+the signal time. Both make the live gap **wider** than the table, not narrower.
 
 ### KStreams, assuming Redis stays the hot path — what it actually buys
 Keep **Redis as the hot-path read cache** (its real strength, §2) and KStreams' own read surface (IQ) goes unused —
