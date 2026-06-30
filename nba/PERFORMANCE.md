@@ -194,12 +194,16 @@ start-rate bound, and what disk-backed state buys when Redis stays the hot path.
 
 ### Component count — Flink collapses the decision path into one job
 The classic decision path is **six hosted services**: snapshot-builder, rules-engine (Drools), action-router,
-**temporal-worker + the Temporal server** (the state machine), and action-layer — plus the shared scorer and the
-shared infra both flavors keep (Redpanda, Redis, the action-library + its Postgres, the BFF). **Flink is ONE job**
-that wires all of it (`SpineJob`: snapshot → rules → score → route → **state-machine → action-layer**). So Flink is
-*internally* more complex (one large stateful, checkpointed job) but **operationally simpler — ~6 processes → 1** —
-and the headline: **it deletes Temporal** (worker + server; here an embedded DB, in prod a whole frontend/history/
-matching cluster + its database). KStreams does **not** consolidate: it adds one service (the decision-engine) and
+**temporal-worker + the Temporal server** (the state machine), and action-layer. And the state machine doesn't live
+in Temporal alone — it **leans on Postgres** for its dynamic per-member state: the per-(member,channel) **send/touch
+counter** (`channel_touch`, bumped atomically at each dispatch), the **in-flight/dispatch tracker** (`nba_inflight`),
+and the transactional **outbox** (the shared `actionlib` DB). On top sit the shared scorer and the shared infra
+(Redpanda, Redis, the action-library, the BFF). **Flink is ONE job** that wires all of it (`SpineJob`: snapshot →
+rules → score → route → **state-machine → action-layer**). So Flink is *internally* more complex (one large stateful,
+checkpointed job) but **operationally simpler — ~6 processes → 1** — and the headline: **it deletes Temporal** (worker
++ server; here an embedded DB, in prod a whole frontend/history/matching cluster + its database) *and* folds the
+state machine's Postgres-backed dynamic state into the stream (below). KStreams does **not** consolidate: it adds one
+service (the decision-engine) and
 reimplements **only the snapshot stage**, keeping classic's rules, scorer, Temporal and action-layer — net component
 count is essentially unchanged.
 
@@ -208,11 +212,16 @@ Temporal's start path is one of the three hard bounds (§3): **~178 workflow-sta
 plateau** that more client concurrency doesn't move (it needs history shards + real persistence to go further). For
 the daily action-dispatch burst that's a wall — starting a few million workflows at ~178/s is **hours**, and it
 competes with live traffic while it drains. Flink's state machine is a **`KeyedProcessFunction` + timers**
-(`StateMachineStage`), so "dispatch" is just keyed state advancing at the **stream rate, partitioned** — no
-per-workflow-start cost, scales with parallelism. **This is the single biggest reason Flink scales where classic
-doesn't: it deletes a hard, single-node bound instead of tuning around it.** The cost is real and worth stating: one
-big stateful job means a hot key or a bug can stall the whole spine, scaling means repartitioning the entire job,
-and recovery is one large checkpoint — versus classic's services that scale and fail independently.
+(`StateMachineStage`) with the throttle gate, the member-keyed dedup, and the `channel_touch` send-counter **ported
+to Flink-managed keyed state** — so "dispatch" is keyed state advancing at the **stream rate, partitioned**, with no
+per-workflow-start cost *and no per-dispatch Postgres round-trip*. So Flink doesn't only delete the Temporal
+server/worker — it also retires the **per-member dynamic state** (`nba_inflight` / `channel_touch`) the classic path
+keeps in Postgres, folding dispatch + throttle + send-counts + dedup into one keyed stream. **That is the scale
+unlock: it removes a single-node start bound *and* a per-dispatch database write at once.** (Postgres still backs the
+action *catalog*, shared by both flavors — Flink reduces the Postgres dependency, it doesn't eliminate it.) The cost
+is real and worth stating: one big stateful job means a hot key or a bug can stall the whole spine, scaling means
+repartitioning the entire job, and recovery is one large checkpoint — versus classic's services that scale and fail
+independently.
 
 ### KStreams, assuming Redis stays the hot path — what it actually buys
 Keep **Redis as the hot-path read cache** (its real strength, §2) and KStreams' own read surface (IQ) goes unused —
@@ -230,6 +239,7 @@ economical Redis RAM.
 |---|---|---|---|
 | **decision-path processes** | ~6 (incl. Temporal worker + server) | ~6 (swaps the snapshot store) | **1 job, no Temporal** |
 | **removes the Temporal start bound?** | no | no | **yes** (state machine in-stream) |
+| **state-machine dynamic state** | Temporal + **Postgres** (`channel_touch` / `nba_inflight`) | Temporal + Postgres (unchanged) | **in-stream keyed state** (no Temporal, no per-dispatch Postgres) |
 | **RAM wall on the source of truth** | yes (Redis-bound) | **no** (RocksDB) | **no** (disk/heap) |
 | **hot-path reads** | **Redis (fast, always-up)** | Redis (IQ unused) | needs Redis write-through |
 | **earns its complexity for** | nothing — it's the simple default | member-state > economical RAM, Redis kept | **dispatch burst + operational consolidation + RAM wall** |
