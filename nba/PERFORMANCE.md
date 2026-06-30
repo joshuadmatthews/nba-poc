@@ -184,3 +184,59 @@ platform via **flash tiering** (spill cold member-state to SSD) instead of buyin
 "TTL'd to hot members" idea in §5, solved by the tier. Migration note: had we run on OSS Premium clustering, the
 snapshot-builder's `JedisPooled` would need cluster-awareness — moving to Managed Redis's single transparent endpoint
 *avoids* that, so it's a simplification, not a port.
+
+---
+
+## 8. What each flavor actually earns — components, Temporal, and the Redis-hot-path question
+
+Throughput (§1, §6) is the *smallest* of the differences. The real trade is **hosted-component count, the Temporal
+start-rate bound, and what disk-backed state buys when Redis stays the hot path.**
+
+### Component count — Flink collapses the decision path into one job
+The classic decision path is **six hosted services**: snapshot-builder, rules-engine (Drools), action-router,
+**temporal-worker + the Temporal server** (the state machine), and action-layer — plus the shared scorer and the
+shared infra both flavors keep (Redpanda, Redis, the action-library + its Postgres, the BFF). **Flink is ONE job**
+that wires all of it (`SpineJob`: snapshot → rules → score → route → **state-machine → action-layer**). So Flink is
+*internally* more complex (one large stateful, checkpointed job) but **operationally simpler — ~6 processes → 1** —
+and the headline: **it deletes Temporal** (worker + server; here an embedded DB, in prod a whole frontend/history/
+matching cluster + its database). KStreams does **not** consolidate: it adds one service (the decision-engine) and
+reimplements **only the snapshot stage**, keeping classic's rules, scorer, Temporal and action-layer — net component
+count is essentially unchanged.
+
+### Flink replacing Temporal is the scale unlock — quantified
+Temporal's start path is one of the three hard bounds (§3): **~178 workflow-starts/s, single-node server-bound, a
+plateau** that more client concurrency doesn't move (it needs history shards + real persistence to go further). For
+the daily action-dispatch burst that's a wall — starting a few million workflows at ~178/s is **hours**, and it
+competes with live traffic while it drains. Flink's state machine is a **`KeyedProcessFunction` + timers**
+(`StateMachineStage`), so "dispatch" is just keyed state advancing at the **stream rate, partitioned** — no
+per-workflow-start cost, scales with parallelism. **This is the single biggest reason Flink scales where classic
+doesn't: it deletes a hard, single-node bound instead of tuning around it.** The cost is real and worth stating: one
+big stateful job means a hot key or a bug can stall the whole spine, scaling means repartitioning the entire job,
+and recovery is one large checkpoint — versus classic's services that scale and fail independently.
+
+### KStreams, assuming Redis stays the hot path — what it actually buys
+Keep **Redis as the hot-path read cache** (its real strength, §2) and KStreams' own read surface (IQ) goes unused —
+fine, since IQ is fragile under load (§2). So KStreams' *only* remaining contribution is on the **write/state side**:
+the authoritative member-state lives in **RocksDB (disk-backed, no RAM wall, sharded per partition)** while Redis is
+demoted to a **write-through, TTL'd hot-member cache**. Classic structurally can't do this — in classic the snapshot
+*is* Redis, so Redis must hold **every** member (the RAM wall). A disk-backed engine (KStreams or Flink) is what lets
+you keep tens of millions of members on disk while Redis caches only the hot working set. **That is the entire value
+of KStreams when Redis stays the hot path: it decouples total state-size from cache-size.** It does not touch the
+rules, the scorer, or the Temporal bound — a narrow state-economics play, worth it only once member-state outgrows
+economical Redis RAM.
+
+### The honest scorecard
+| | classic | KStreams | Flink |
+|---|---|---|---|
+| **decision-path processes** | ~6 (incl. Temporal worker + server) | ~6 (swaps the snapshot store) | **1 job, no Temporal** |
+| **removes the Temporal start bound?** | no | no | **yes** (state machine in-stream) |
+| **RAM wall on the source of truth** | yes (Redis-bound) | **no** (RocksDB) | **no** (disk/heap) |
+| **hot-path reads** | **Redis (fast, always-up)** | Redis (IQ unused) | needs Redis write-through |
+| **earns its complexity for** | nothing — it's the simple default | member-state > economical RAM, Redis kept | **dispatch burst + operational consolidation + RAM wall** |
+
+**Bottom line.** KStreams earns its keep **only** as a state-size play — disk-backed authoritative state behind a
+Redis hot cache; it leaves the dispatch bound and the component count untouched. **Flink earns the most**: it is the
+one flavor that both **shrinks the operational footprint** (≈6 processes → 1) and **removes a hard scale bound**
+(Temporal's ~178/s start path). So when the RAM / burst / dispatch math finally binds, the bigger lever is **Flink,
+not KStreams** — it attacks the dispatch ceiling and the service sprawl at once, with Redis retained purely as the
+fast hot-read cache.
