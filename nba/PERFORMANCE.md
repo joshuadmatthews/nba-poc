@@ -185,6 +185,30 @@ platform via **flash tiering** (spill cold member-state to SSD) instead of buyin
 snapshot-builder's `JedisPooled` would need cluster-awareness — moving to Managed Redis's single transparent endpoint
 *avoids* that, so it's a simplification, not a port.
 
+**At our prod scale — where does it actually bind?** Prod runs **10 partitions of everything** for **~200M
+messages/day ≈ ~2,315/s average** (~231/s per partition; ~5–12k/s at peak). That's ~12% of the measured per-partition
+snapshot bound (~2 k/s), and even at peak only ~10–15% of a *single* OSS-Redis thread (~80–100k ops/s). **So at
+200M/day the write *rate* is not the bottleneck** — on either engine, either Redis: 10 lanes carry ~2–9× headroom and
+one Redis thread absorbs the aggregate. The constraint that actually binds at this scale is the **RAM wall**, and it's
+set by the **member population** (× ~4.6 KB/snapshot), *not* the message rate — tens of millions of members is
+tens-to-hundreds of GB, exactly where OSS Redis's ~120 GB cap vs Managed Redis's **flash tiering** vs a disk-backed
+engine's **no-wall** diverge.
+
+**Where partitioning changes the story (the growth hedge).** The single-thread *write* ceiling only bites ≳10× higher
+(toward billions/day / >80–100k writes/s) — and there the two disk-backed engines pull ahead **by construction**:
+KStreams/Flink write **partition-local RocksDB**, so write capacity scales **linearly with the same 10 (→ N)
+partitions we already run** — no central store to saturate, no RAM wall. A single unsharded Redis can't; matching it
+means clustering (OSS: many single-threaded shards + a cluster-aware client) or leaning on Managed Redis's
+multi-threaded nodes. Measured that it scales: 1 partition folded ~2,058/s, **2 partitions/2 instances ~5,263/s**
+(partition-linear).
+
+**"Which Redis" is undecided — so the safe hedge is not to bet on it.** On **Azure Cache for Redis** (single-thread,
+RAM-capped, retiring) both ceilings bind sooner and partitioned RocksDB is the stronger play; on **Azure Managed
+Redis** (multi-threaded + flash + transparent clustering) they bind far later and Redis stays viable. Since that
+choice is open, the **disk-backed partitioned state (KStreams or Flink) is Redis-flavor-independent** — it scales
+writes *and* state with the compute partitions we already run, whichever Redis we land on (kept purely as the
+hot-read cache). That independence is itself an argument for it at 200M/day-and-growing.
+
 ---
 
 ## 8. What each flavor actually earns — components, Temporal, and the Redis-hot-path question
@@ -339,8 +363,12 @@ Redis-network write is **not** the limiter. So even with **Temporal *and* scorer
 throughput is identical and both scale out with partitions. **KStreams is not a throughput play.**
 
 What it *does* buy — two real, non-throughput properties:
-1. **No RAM wall.** Classic's snapshot *is* Redis → every member in RAM (~1.7M @ 8 GB, then OOM). KStreams' state is
-   **RocksDB (disk, sharded per partition)** → tens of millions on disk, Redis kept only as the hot-read cache.
+1. **No central-store ceiling — RAM *or* write-thread.** Classic's snapshot *is* Redis, so a single Redis is both a
+   **RAM wall** (~1.7M @ 8 GB, then OOM) *and* a **single-thread write ceiling** (~80–100k ops/s on OSS / Azure Cache
+   for Redis) that all lanes funnel into. KStreams' state is **RocksDB, partition-local** → writes *and* state scale
+   **linearly with partitions** (no central store, no RAM wall). At our 10-partition / ~200M-day scale the write rate
+   has ample headroom on either engine (§7), so this is a **growth hedge** — and a **Redis-flavor-independent** one:
+   it doesn't care whether prod lands on Azure Cache for Redis or Managed Redis.
 2. **Emit-exact recovery — no re-eval storm.** KStreams commits its **state changelog + the input offset in one EOS
    transaction**, so a state loss restores from the changelog and **resumes emit-exact**: only *genuinely changed*
    snapshots re-emit, so only real evals/scorings fire. Measured — a mid-replay restart re-emitted **+1,079**, not the
