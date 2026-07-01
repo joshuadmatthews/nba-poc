@@ -134,11 +134,17 @@ start path) are.** The shape the testing converges on is a **hybrid**:
   (Netty/Javalin + routing-aware client) for prod read QPS; the state store itself is production-grade.
 - **Flink** — the pick when the goal is to **bypass Temporal**. It's the bigger lever: it gets *both* of
   KStreams' state-tier wins **and** collapses ~7 processes → 1 (drops Temporal + the Postgres dynamic state +
-  the Debezium/outbox tier) **and** removes the ~178/s Temporal start bound (bulk-suppress ~4.7 s/1M vs ~1.6 h).
-  It attacks the dispatch ceiling, the RAM wall, and the component count in one move — and keeps Redis as the
-  read mirror (less to productionize than KStreams' Redis-free path, since Redis reads are already prod-grade).
-  Cost: you give up Temporal's per-workflow reset/terminate/query + history UI (domain suppress/cancel *is*
-  wired in-stream; see §8's *Temporal trade*).
+  the Debezium/outbox tier) **and** removes the ~178/s Temporal start bound — its in-stream state machine
+  **dispatches ~424/s avg, peak ~1,086/s (measured, §8b), 6–10× Temporal**, and bulk-suppress is ~4.7 s/1M vs
+  ~1.6 h. It attacks the dispatch ceiling, the RAM wall, and the component count in one move — keeping Redis as
+  the read mirror (Queryable State is deprecated in 1.18). Costs are real and now **measured**: (1) you give up
+  Temporal's per-workflow reset/terminate/query + history UI (domain suppress/cancel *is* wired in-stream; §8's
+  *Temporal trade*); and (2) **the POC's Flink authoritative path needs production hardening** — the embedded
+  MiniCluster has **no externalized-checkpoint HA** (a process kill loses in-flight job state, though external
+  Redis+Kafka survives), it **destabilized a constrained shared box** under sustained authoritative load (needs
+  a resourced cluster, and the Redis write-through read-mirror is the scale-limiter), and its **DLQ path is
+  unverified at runtime** (never crash-loops on poison, but no DLQ record was observed — §8b). Flink is the
+  strongest *engine* and the weakest *operational maturity* of the three today.
 
 **Net:** the campaign made **KStreams the best "keep Temporal, drop Redis" option**, but it did **not** dethrone
 **Flink as the answer to "bypass Temporal"** — the two win on different axes and are not competing for the same
@@ -434,7 +440,9 @@ same NBAs.
 | | classic | KStreams | Flink |
 |---|---|---|---|
 | **decision-path processes** | ~7 (incl. Temporal worker + server, Debezium) | ~7 (swaps the snapshot store) | **1 job, no Temporal** |
-| **removes the Temporal start bound?** | no | no | **yes** (state machine in-stream) |
+| **removes the Temporal start bound?** | no | no | **yes** — in-stream SM dispatches **~424/s avg, peak ~1,086/s** (measured, §8b) vs Temporal **~178/s** = 6–10× |
+| **hot-path read under concurrency** | Redis flat to ~80k ops/s | **IQ: 1.0 ms @ C=1 → 7 ms @ C=10 → 34 ms @ C=50**, plateaus ~1.3–1.7k rps, 0 errors (com.sun shim, §8b) | Redis (flat, always-up) |
+| **production robustness** | **mature** — Redis/Temporal are battle-tested, no caveats | IQ read shim needs Netty for prod QPS; state store prod-grade | **needs hardening** — embedded MiniCluster has no externalized-checkpoint HA (process kill = job-state loss, §8b), destabilized a constrained box under authoritative load, DLQ path unverified |
 | **state-machine dynamic state** | Temporal + **Postgres** (`channel_touch` / `nba_inflight`) | Temporal + Postgres (unchanged) | **in-stream keyed state** (no Temporal, no per-dispatch Postgres) |
 | **reliable publish to Kafka** | outbox → **Debezium** CDC | outbox → Debezium (unchanged) | **direct EOS Kafka sink** (no outbox/CDC) |
 | **single-instance ops** | Temporal: query / **reset / terminate any one workflow** + history UI | Temporal (unchanged) | domain **cancel (suppress) ✓**; no out-of-band reset/terminate or per-key history UI |

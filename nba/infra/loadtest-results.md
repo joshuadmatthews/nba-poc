@@ -281,6 +281,71 @@ app-representatively — it's a wash. The real read-model story per flavor is: *
 KStreams = IQ/RocksDB (no Redis, HA-tuned, latency-neutral), Flink = Redis write-through (QS deprecated)** — and
 all three are **proven to emit identical decisions** (§8a), so the flavor choice is purely operational.
 
+### 8b. Complete-system-per-flavor + robustness campaign (dispatch keystone, IQ concurrency, failure modes)
+Goal: a **complete working system on each flavor** and every remaining tradeoff **measured** — the Flink
+dispatch throughput (the "bypass Temporal" keystone, never quantified before), the IQ concurrency ceiling, and
+the failure modes (poison, recovery, stability).
+
+**Flink — complete authoritative system: PROVEN.** Booted Flink authoritative as the *entire* spine (classic
+stopped) — one embedded job with 8 Kafka sources (facts, rules-snaps, rules-defs, score-evals, route-evals,
+sm-facts, sm-defs, al-acts). Seeded 3,000 members → the full loop ran end-to-end: 3,045 snapshots + 3,045
+eligibility in Redis (write-through), 305k snapshot records, 62k evaluations, 8,638 activations, dispositions
+looping back. Flink genuinely replaces the ~7-process classic spine with one process.
+
+**Flink dispatch throughput — MEASURED (the keystone, was inferred).** With Redis write-through OFF (to isolate
+the state-machine from the read-mirror backpressure — see stability below), a 5,000-member burst drove:
+`activations 6,915 → 31,082 in ~57 s` = **~424/s average, peak intervals ~1,086/s**; evaluations ~1,160/s.
+That is **6–10× Temporal's ~178/s single-node start ceiling** (§6a) — the "Flink bypasses the Temporal dispatch
+bound" claim, finally quantified. It's EOS-checkpoint-bound (10 s checkpoints), not a hard server bound, and
+scales with parallelism.
+
+**Flink failure modes — honest robustness findings:**
+- **Recovery across a process kill: NOT covered by the POC.** Hard-killed the Flink container mid-burst and
+  restarted → `No checkpoint found during restore` — the embedded MiniCluster has **no externalized
+  checkpoints / HA**, so it restarts the job fresh from the source offset. External state survived (Redis
+  mirror + Kafka EOS-committed activations), but in-memory job state (debounce timers, in-flight dispatches)
+  was lost. *Within-job* task failures are covered by EOS checkpoints (standard Flink); a **JobManager/process
+  loss is not** until you configure `state.checkpoints.dir` + HA. Real prod-hardening gap.
+- **Stability under sustained authoritative load: hit a ceiling on the constrained box.** Flink authoritative
+  **with Redis write-through ON** stalled at ~10k members (the snapshot operator's per-record idmap-mint +
+  Redis write backpressured the source to a crawl — the §6b "write-through collapses throughput to the
+  Redis-write rate" effect), and a sustained 5k-member run **destabilized the shared single box → the podman
+  VM restarted** (Flink authoritative + the full loop + the rest of the AIServices stack on one machine). So
+  the write-through read-mirror path is the scale-limiter, and Flink authoritative needs a **resourced cluster**,
+  not a shared dev box. (The dispatch number above was measured write-through OFF precisely to separate the
+  in-stream engine from this read-mirror ceiling.)
+- **Poison: never crash-looped; DLQ not observed at runtime (inconclusive).** Injected malformed/non-JSON
+  records repeatedly; Flink **never crash-looped** (stayed up, RestartCount 0) — the critical property. But no
+  record landed in `nba.dlq.flink-engine` despite the wired path (`ClassifyResolveFn:57` DLQs unparseable JSON,
+  sunk at `SpineJob:44`). Runtime observation was confounded (the authoritative loop churns member.facts so a
+  just-produced poison is buried; and one run ended in the VM restart). **Verdict: inconclusive — needs a
+  deterministic harness/unit test on `ClassifyResolveFn`, not a live probe.**
+
+**KStreams — complete system + IQ concurrency ceiling.** decision-engine (shadow) builds the same RocksDB
+snapshot store (equivalence-proven, §8a) and serves IQ alongside classic — stable, non-disruptive. The IQ read
+surface under concurrency (`GET /snapshot/{id}`, `com.sun` HttpServer, N=2,000/level):
+
+| concurrency | p50 | p95 | p99 | rps | errors |
+|---|---|---|---|---|---|
+| C=1  | **1.0 ms** | 1.6 ms | 2.4 ms | 925 | 0 |
+| C=4  | 2.2 ms | 3.3 ms | 4.6 ms | 1,738 | 0 |
+| C=10 | **7.2 ms** | 11.8 ms | 14.7 ms | 1,311 | 0 |
+| C=50 | **34.2 ms** | 57.5 ms | 68.6 ms | 1,309 | 0 |
+
+Latency-neutral vs Redis at low concurrency (1.0 ms), but the **single-thread `com.sun` shim saturates at
+~1.3–1.7k rps** — beyond that, latency balloons (7 ms @ C=10, 34 ms @ C=50) while throughput plateaus. Crucially
+**zero errors at every level** — it degrades gracefully (queues), it doesn't fail. Redis scales to ~80k ops/s,
+so for high read QPS the HTTP shim (not the RocksDB store) is the limiter → Netty/Javalin needed for prod QPS.
+
+**Classic — the baseline** (unchanged): Redis-native reads (1.66 ms, scale to ~80k ops/s), fold ~2,865/s,
+Temporal dispatch ~178/s, the RAM wall. Simplest to operate, no robustness caveats.
+
+**Net:** every flavor is a *complete working system* and the tradeoffs are now measured, including the rough
+edges — Flink's dispatch is 6–10× Temporal (real) **but** its authoritative POC needs production hardening
+(externalized-checkpoint HA, a resourced cluster, a verified DLQ path); KStreams uniquely drops Redis with a
+read surface that's latency-neutral but throughput-capped by the com.sun shim; classic is the robust,
+unremarkable default.
+
 ## Verdict (evidence-based; read-surface bullets updated per §8)
 - **~~At this scale: keep Redis. Faster reads (10×)…~~** — *superseded by §8.* App-representative reads are a
   **wash** (Redis 1.66 ms vs IQ 1.53 ms), not 10×; the §2 0.25 ms was a raw `redis-benchmark` GET, not the
