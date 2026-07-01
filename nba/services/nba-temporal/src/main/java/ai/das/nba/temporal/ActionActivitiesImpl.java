@@ -241,6 +241,11 @@ public class ActionActivitiesImpl implements ActionActivities {
     }
 
     @Override
+    public boolean operatorSuppressed(Activation act) {
+        return NbaTemporalWorker.isOperatorSuppressed(act.actionId, act.channel);
+    }
+
+    @Override
     public void throttleEnterBacklog(Activation act) { throttle.enterBacklog(act.channel); }
 
     @Override

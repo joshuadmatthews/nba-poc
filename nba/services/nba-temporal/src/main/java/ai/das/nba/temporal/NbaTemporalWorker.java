@@ -218,6 +218,23 @@ public class NbaTemporalWorker {
         }
     }
 
+    // Live operator-suppressed targets (actionId, or actionId.channel). BOTH suppress and unsuppress ride the SAME
+    // nba.definitions ACTION_SUPPRESS broadcast (value=true -> add, value=false -> remove); every worker instance
+    // tails it (own group, see runSuppressFeed) and converges its OWN in-memory view, so the dispatch gate decides
+    // LOCALLY — no runtime call back to the action-library (whose only role is the producer: POST /suppress writes
+    // the flag). The gate reads this so a workflow CREATED *after* the point-in-time batch op — a backlogged CREATE
+    // drained later, or one that sat in the throttle backlog through the pull — still self-suppresses instead of
+    // sending (the batch op alone only catches what was already RUNNING); an unsuppress over the same channel lets it
+    // dispatch again.
+    static final java.util.Set<String> OPERATOR_SUPPRESSED = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** Is (actionId, channel) operator-suppressed right now? Matches an action-wide flag OR the action-channel flag. */
+    static boolean isOperatorSuppressed(String actionId, String channel) {
+        if (actionId == null || actionId.isEmpty()) return false;
+        if (OPERATOR_SUPPRESSED.contains(actionId)) return true;
+        return channel != null && !channel.isEmpty() && OPERATOR_SUPPRESSED.contains(actionId + "." + channel);
+    }
+
     // nba.definitions -> operator ACTION_SUPPRESS flags are ACTION-LEVEL PRIORITY signals. They ride the low-volume
     // definitions broadcast (own consumer group -> EVERY worker instance sees every flag), so an operator suppress
     // fires immediately instead of queuing behind the member.facts CREATE backlog the member-keyed bridge drains.
@@ -239,9 +256,11 @@ public class NbaTemporalWorker {
                     if (!key.startsWith("ACTION_SUPPRESS:") || r.value() == null) continue;
                     var v = M.readTree(r.value());
                     String target = key.substring("ACTION_SUPPRESS:".length());
+                    boolean on = v.path("value").asBoolean(false);
+                    if (on) OPERATOR_SUPPRESSED.add(target); else OPERATOR_SUPPRESSED.remove(target);  // live gate state (incl. replay warm-up)
                     Long last = fired.get(target);
                     long eventTs = v.path("eventTs").asLong(0);
-                    if (!shouldFanSuppress(v.path("value").asBoolean(false), eventTs, startTime, last == null ? 0L : last))
+                    if (!shouldFanSuppress(on, eventTs, startTime, last == null ? 0L : last))
                         continue;
                     fired.put(target, eventTs);
                     startSuppression(client, v.path("actionId").asText(""), v.path("channel").asText(""), eventTs, "defs");

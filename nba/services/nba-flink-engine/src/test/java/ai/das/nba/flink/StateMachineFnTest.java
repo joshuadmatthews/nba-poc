@@ -188,6 +188,23 @@ class StateMachineFnTest {
         return new FactRecord("ACTION_SUPPRESS:" + target, v, "action-suppress", 1L);
     }
 
+    /** The dispatch gate: a CREATE that reaches the gate while the action is suppressed self-suppresses (never
+     *  sends) — the fleet fan-out only catches instances that already existed when the flag flipped. And it's
+     *  bidirectional: an UNSUPPRESS over the same defs broadcast lets a later CREATE dispatch again. */
+    @Test void gateBlocksNewCreatesWhileSuppressed_thenUnsuppressReenables() throws Exception {
+        var h = smHarness(1);
+        h.processBroadcastElement(actionSuppress("act1", "", true), 1L);         // suppress arrives first
+        h.processElement(new StateEvent("nbaA:act1:push", "CREATE", createFact("nbaA", "mA", "act1", "push")), 2L);
+        h.setProcessingTime(60_000L);                                            // debounce -> gate -> SUPPRESSED (no send)
+        assertEquals(1, countState(h, "SUPPRESSED"), "a CREATE while suppressed self-suppresses at the gate");
+        assertEquals(0, countState(h, "IN_PROCESS"), "and does NOT dispatch");
+        h.processBroadcastElement(actionSuppress("act1", "", false), 61L);       // UNSUPPRESS over the same defs channel
+        h.processElement(new StateEvent("nbaB:act1:push", "CREATE", createFact("nbaB", "mB", "act1", "push")), 62L);
+        h.setProcessingTime(120_000L);
+        assertEquals(1, countState(h, "IN_PROCESS"), "after unsuppress (over defs), a new CREATE dispatches again");
+        h.close();
+    }
+
     @Test void actionSuppressFlagFansFleetCancelOnTransitionOnly() throws Exception {
         var h = smHarness(300);
         h.processElement(new StateEvent("nbaA:act1:email", "CREATE", createFact("nbaA", "mA", "act1", "email")), 1L);

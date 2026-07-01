@@ -105,6 +105,17 @@ public class ChannelActionWorkflowImpl implements ChannelActionWorkflow {
             return;
         }
 
+        // FINAL GATE before send: honor a LIVE operator suppression. The point-in-time suppress batch op only
+        // cancels workflows already RUNNING when the operator pulled the action — one CREATED after that (a
+        // backlogged CREATE drained later, or one that sat in the throttle backlog through the pull) would otherwise
+        // send. Reading the live suppressed set here catches them; it's bidirectional, so an unsuppress lets the
+        // action dispatch again. This is a pre-send terminal, so it's a real SUPPRESSED (operator pull), not DEBOUNCED.
+        if (activities.operatorSuppressed(act)) {
+            operatorSuppressRequested = true; emit(act, "SUPPRESSED");
+            log.info("SUPPRESSED (operator-suppressed at dispatch) {}", act.slug());
+            return;
+        }
+
         // Hand off — emit IN_PROCESS (activation sent, no provider response yet); the activation layer then
         // walks us PRESENTED (delivered) -> SOFT_COMPLETED (engaged) via dispositions.
         activities.emitActivation(act, "DISPATCH");

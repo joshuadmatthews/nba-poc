@@ -279,4 +279,22 @@ class NbaTemporalWorkerTest {
         assertFalse(NbaTemporalWorker.shouldFanSuppress(true, 2_000L, start, 2_000L), "a redelivered already-fired eventTs is skipped");
         assertTrue(NbaTemporalWorker.shouldFanSuppress(true, 3_000L, start, 2_000L), "a newer suppress for the same target fires again");
     }
+
+    // ---- the live dispatch-gate set: worker-local, defs-derived, bidirectional (an unsuppress re-enables) ---------
+
+    @Test
+    void isOperatorSuppressed_actionWide_channelScoped_andBidirectional() {
+        NbaTemporalWorker.OPERATOR_SUPPRESSED.clear();
+        assertFalse(NbaTemporalWorker.isOperatorSuppressed("act_x", "email"), "nothing suppressed -> dispatch");
+        NbaTemporalWorker.OPERATOR_SUPPRESSED.add("act_x");                       // action-wide flag
+        assertTrue(NbaTemporalWorker.isOperatorSuppressed("act_x", "email"), "action-wide suppresses every channel");
+        assertTrue(NbaTemporalWorker.isOperatorSuppressed("act_x", "sms"));
+        NbaTemporalWorker.OPERATOR_SUPPRESSED.clear();
+        NbaTemporalWorker.OPERATOR_SUPPRESSED.add("act_y.push");                  // channel-scoped flag
+        assertTrue(NbaTemporalWorker.isOperatorSuppressed("act_y", "push"), "channel-scoped hits only that channel");
+        assertFalse(NbaTemporalWorker.isOperatorSuppressed("act_y", "email"));
+        NbaTemporalWorker.OPERATOR_SUPPRESSED.remove("act_y.push");               // unsuppress flows over defs -> remove
+        assertFalse(NbaTemporalWorker.isOperatorSuppressed("act_y", "push"), "after unsuppress, the action dispatches again");
+        NbaTemporalWorker.OPERATOR_SUPPRESSED.clear();
+    }
 }

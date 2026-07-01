@@ -28,6 +28,12 @@ public interface ActionActivities {
     @ActivityMethod
     String throttleGate(Activation act);
 
+    /** Is this action(-channel) operator-suppressed RIGHT NOW? Checked at the dispatch gate so a workflow created
+     *  after the point-in-time suppress batch op (e.g. a backlogged CREATE) still self-suppresses instead of sending.
+     *  Reads the live, bidirectional OPERATOR_SUPPRESSED set (an unsuppress lets the action dispatch again). */
+    @ActivityMethod
+    boolean operatorSuppressed(Activation act);
+
     /** Join the channel's THROTTLED backlog (on first WAIT) — feeds the saturation prediction. */
     @ActivityMethod
     void throttleEnterBacklog(Activation act);

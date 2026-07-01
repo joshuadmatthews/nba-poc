@@ -209,8 +209,28 @@ public class StateMachineFn extends KeyedBroadcastProcessFunction<String, StateE
         }
     }
 
+    /** Is (actionId, channel) operator-suppressed right now, per the LIVE ACTION_SUPPRESS flags in the definitions
+     *  broadcast state? Action-wide flag OR the action-channel flag. Bidirectional — an unsuppress (value=false)
+     *  clears it, so the action dispatches again. In-stream read; no external call. */
+    private static boolean isOperatorSuppressed(ReadOnlyContext ctx, String actionId, String channel) {
+        try {
+            var defs = ctx.getBroadcastState(DEFS_DESC);
+            if (onFlag(defs.get("ACTION_SUPPRESS:" + actionId))) return true;
+            return channel != null && !channel.isEmpty() && onFlag(defs.get("ACTION_SUPPRESS:" + actionId + "." + channel));
+        } catch (Exception e) { return false; }
+    }
+
     /** The throttle gate: SEND -> dispatch; WAIT -> hold + recheck (trickle); SUPPRESS -> reroute. */
     private void gate(SmState st, ReadOnlyContext ctx, Collector<KafkaOut> out) throws Exception {
+        // FINAL GATE before send: honor a LIVE operator suppression. The broadcast fleetSuppress only cancels
+        // instances that already existed when the flag flipped; one that reaches the gate AFTER (a backlogged CREATE,
+        // or one that sat in the throttle backlog through the pull) self-suppresses here. Bidirectional via the flag.
+        if (isOperatorSuppressed(ctx, st.actionId, st.channel)) {
+            if (st.inBacklog) { throttle.exitBacklog(st.channel); st.inBacklog = false; }
+            emit(st, "SUPPRESSED", out, ctx);
+            terminal(st, ctx);
+            return;
+        }
         long now = ctx.timerService().currentProcessingTime();
         String decision = throttle.admit(st.channel, now);
         if (ThrottleGate.SEND.equals(decision)) {
