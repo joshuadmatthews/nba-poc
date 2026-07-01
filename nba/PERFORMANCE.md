@@ -327,16 +327,33 @@ priority signal — the same pattern the Flink engine uses), and the bridge conc
 await the cancel disposition/TTL — so the wall-clock to fully *drain* exceeds even
 the signal time. Both make the live gap **wider** than the table, not narrower.
 
-### KStreams, assuming Redis stays the hot path — what it actually buys
-Keep **Redis as the hot-path read cache** (its real strength, §2) and KStreams' own read surface (IQ) goes unused —
-fine, since IQ is fragile under load (§2). So KStreams' *only* remaining contribution is on the **write/state side**:
-the authoritative member-state lives in **RocksDB (disk-backed, no RAM wall, sharded per partition)** while Redis is
-demoted to a **write-through, TTL'd hot-member cache**. Classic structurally can't do this — in classic the snapshot
-*is* Redis, so Redis must hold **every** member (the RAM wall). A disk-backed engine (KStreams or Flink) is what lets
-you keep tens of millions of members on disk while Redis caches only the hot working set. **That is the entire value
-of KStreams when Redis stays the hot path: it decouples total state-size from cache-size.** It does not touch the
-rules, the scorer, or the Temporal bound — a narrow state-economics play, worth it only once member-state outgrows
-economical Redis RAM.
+### KStreams — what it actually buys (measured), and what it doesn't
+KStreams (`nba-decision-engine`) **materializes** the rules output — it does *not* reimplement rules, and everything
+downstream (Temporal bridge, scorer, hot path — plus the suppress + concurrency fixes above) is **byte-for-byte the
+classic path**. It differs on exactly one axis: the **snapshot/eligibility store** (Redis → RocksDB).
+
+**Throughput is a wash — measured.** Replaying a 2.66M-record `nba.member.facts` backlog (single partition, shadow),
+KStreams folds at **~2,058/s** vs the classic snapshot-builder's **~1,950/s**. Both are **EOS-commit-bound** (KStreams
+`exactly_once_v2` @ 100 ms commit, ~59% CPU; classic per-batch transactions) — *not* store-bound; RocksDB-local vs
+Redis-network write is **not** the limiter. So even with **Temporal *and* scorer scaled to infinity**, per-partition
+throughput is identical and both scale out with partitions. **KStreams is not a throughput play.**
+
+What it *does* buy — two real, non-throughput properties:
+1. **No RAM wall.** Classic's snapshot *is* Redis → every member in RAM (~1.7M @ 8 GB, then OOM). KStreams' state is
+   **RocksDB (disk, sharded per partition)** → tens of millions on disk, Redis kept only as the hot-read cache.
+2. **Emit-exact recovery — no re-eval storm.** KStreams commits its **state changelog + the input offset in one EOS
+   transaction**, so a state loss restores from the changelog and **resumes emit-exact**: only *genuinely changed*
+   snapshots re-emit, so only real evals/scorings fire. Measured — a mid-replay restart re-emitted **+1,079**, not the
+   +624k it had already built. Classic can't match this: its Redis write is a **dual-write *outside* the Kafka
+   transaction**, so state and offset aren't atomic — even the smart rebuild (from the compacted `nba.snapshots` topic
+   + delta replay) must replay a **conservative overlap** and **over-emit** it (`SnapshotBuilder:54` re-emits every
+   touched member, *"NOT gated on whether Redis changed"*, because it can't tell a reprocess from a change) → a re-eval
+   + re-score pass proportional to that overlap. It's a **resilience/cost** property, and **Flink shares it** (EOS keyed
+   state) — classic is the one that pays, because its store sits outside the transaction.
+
+*Read-model caveat:* the engine **as built** serves reads from **IQ** (local RocksDB, "no Redis") — fastest happy-path,
+but IQ is fragile under load/failover (§2). The alternative keeps **Redis as the hot cache** with RocksDB as the
+disk-backed authoritative store (IQ unused). Which wins depends on whether you trust IQ at your load.
 
 ### The honest scorecard
 | | classic | KStreams | Flink |
@@ -348,13 +365,17 @@ economical Redis RAM.
 | **single-instance ops** | Temporal: query / **reset / terminate any one workflow** + history UI | Temporal (unchanged) | domain **cancel (suppress) ✓**; no out-of-band reset/terminate or per-key history UI |
 | **bulk / fleet-wide suppress** | Batch Operation — O(N) **durable** signals (~1.6 h / 1M @ measured bound) | Temporal (unchanged) | **broadcast → keyed-state fan-out** (wired via `POST /suppress`; measured **~4.7 s / 1M**) |
 | **RAM wall on the source of truth** | yes (Redis-bound) | **no** (RocksDB) | **no** (disk/heap) |
-| **hot-path reads** | **Redis (fast, always-up)** | Redis (IQ unused) | needs Redis write-through |
+| **state-build throughput (1 partition)** | ~1,950/s (measured) | **~2,058/s (measured)** — wash, EOS-commit-bound | in-stream (not the bound) |
+| **recovery re-eval** | **replay + over-emit** (Redis dual-write, not atomic w/ offset) | **emit-exact** (state+offset one EOS txn) | **emit-exact** (EOS checkpoint) |
+| **hot-path reads** | **Redis (fast, always-up)** | IQ (local µs, fragile) *or* Redis cache | needs Redis write-through |
 | **earns its complexity for** | nothing — it's the simple default | member-state > economical RAM, Redis kept | **dispatch burst + operational consolidation + RAM wall** |
 
-**Bottom line.** KStreams earns its keep **only** as a state-size play — disk-backed authoritative state behind a
-Redis hot cache; it leaves the dispatch bound and the component count untouched. **Flink earns the most**: it is the
-one flavor that both **shrinks the operational footprint** (≈7 processes → 1, dropping Temporal + the Postgres dynamic
-state + the Debezium/outbox tier) and **removes a hard scale bound** (Temporal's ~178/s start path). The trade is
+**Bottom line.** KStreams earns its keep on the **state tier** — disk-backed authoritative state (no RAM wall) with
+**emit-exact recovery** (no re-eval storm) — behind a Redis hot cache; it leaves the dispatch bound, the throughput
+(~2,000/s per partition, a measured wash), and the component count untouched. **Flink earns the most**: it gets *both*
+of KStreams' state-tier wins (disk-backed state + EOS emit-exact recovery) **and** additionally **shrinks the
+operational footprint** (≈7 processes → 1, dropping Temporal + the Postgres dynamic state + the Debezium/outbox tier)
+and **removes a hard scale bound** (Temporal's ~178/s start path). The trade is
 real — you give up Temporal's **per-workflow durability, isolation, and interactive control** (*The Temporal trade*
 above) — but because the same canonical events flow either way, **observability stays good**. So when the RAM / burst
 / dispatch math binds, the bigger lever is **Flink, not KStreams** — it attacks the dispatch ceiling and the service
