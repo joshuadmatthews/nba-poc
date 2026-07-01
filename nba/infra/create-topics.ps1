@@ -16,7 +16,7 @@
   Consumer DLQs are created per-consumer when those services are built.
 #>
 [CmdletBinding()]
-param()
+param([int]$Partitions = 2)   # keyed by memberId -> members hash to stable partitions; local test = 2, prod = 10
 $ErrorActionPreference = 'Stop'
 
 $topics = @(
@@ -29,7 +29,7 @@ $topics = @(
   'nba.definitions'    # latest action/rule defs + THROTTLE:{channel} level (broadcast to every rules-engine instance)
 )
 foreach ($t in $topics) {
-  podman exec ais-nba-redpanda rpk topic create $t -p 1 -r 1 -c cleanup.policy=compact 2>$null
+  podman exec ais-nba-redpanda rpk topic create $t -p $Partitions -r 1 -c cleanup.policy=compact 2>$null
 }
 # nba.definitions carries latest-per-key state (defs + the broadcast throttle level), so it MUST be
 # compacted — keeps only the latest THROTTLE:{channel} so a fresh rules-engine pod replays the current
@@ -55,7 +55,7 @@ $dlqs = @(
   'nba.dlq.temporal-bridge'        # nba-temporal activation bridge (nba.member.facts)
 )
 foreach ($t in $dlqs) {
-  podman exec ais-nba-redpanda rpk topic create $t -p 1 -r 1 -c cleanup.policy=delete -c retention.ms=604800000 2>$null
+  podman exec ais-nba-redpanda rpk topic create $t -p $Partitions -r 1 -c cleanup.policy=delete -c retention.ms=604800000 2>$null
 }
 Write-Host "--- NBA topics ---"
 podman exec ais-nba-redpanda rpk topic list
