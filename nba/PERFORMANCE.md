@@ -38,14 +38,35 @@ swap a KieSession-per-eval for an in-JVM condition-tree on heap state.
 
 ## 2. Read profile (the synchronous hot path)
 
-| read path | idle p50 | under max write load | p99 | concurrency |
-|---|---|---|---|---|
-| **Redis HGETALL** | 0.25 ms | **0.25 ms (unaffected)** | 0.8 ms | scales fine (−c 10, ~80k ops/s) |
-| **IQ /snapshot (RocksDB)** | 2.4 ms | ~3 ms | 8–23 ms | **degrades 3.5× to ~8 ms @ C=10**; 100% HTTP 500 during rebalance/recovery |
+The hot path is a point read of one member's current state (snapshot / eligibility) on the channel they just
+used. Each flavor serves that read from a different store — and the **read model is the real differentiator
+between the flavors, not the latency** (which is a wash, ~1.5–1.7 ms across all three, measured
+app-representatively over the podman bridge — one network hop, the way the app actually reads).
 
-Redis reads are ~10× faster, flat under write load, and live in independent infra that stays up. The KStreams
-Interactive-Query surface is a **liability as built** (single-threaded `com.sun` HttpServer, dies with the stream
-app). `redis-benchmark` ceiling for reference: SET 86k/s, GET 77k/s, HSET 82k/s, p50 ~0.3 ms.
+| flavor | hot-path read store | read p50 (p95) | Redis required? |
+|---|---|---|---|
+| **classic** | Redis `HGETALL nba:snapshot:{id}` | **1.66 ms** (~14.4k rps) | **yes** — Redis is the authoritative read store |
+| **KStreams** | Interactive Query → local RocksDB (HTTP `GET /snapshot/{id}`) | **1.53 ms** (3.12 ms) | **no** — serves from its own state; Redis dropped |
+| **Flink** | Redis write-through mirror (`RouterFn` writes through on the authoritative path) | **1.66 ms** (== classic) | **yes** — Queryable State is deprecated in 1.18, so Flink mirrors to Redis rather than serving from state |
+
+**Headline: read latency is a wash (~1.5–1.7 ms across all three).** What differs is *what infra the read needs*:
+
+- **KStreams uniquely drops Redis.** With the IQ surface tuned for availability — KIP-535 stale reads
+  (`enableStaleStores()`) + serve-from-standby (a standby-holding pod answers from its warm copy instead of
+  bouncing to a possibly-dead active; `IqServer.java:78,88`) — reads stay up through a node kill (validated:
+  200 reads straight through a rolling instance failure) and come back **latency-neutral vs Redis** (1.53 vs
+  1.66 ms). This is the earlier "liability as built" surface, fixed: the availability problem was the
+  redirect-to-dead-active, not the store. *Caveat: the read surface itself is still the POC `com.sun`
+  `HttpServer` — single-threaded, measured earlier to degrade ~3.5× (~8 ms) at read-concurrency 10. The state
+  store is production-grade; the HTTP shim is not — for production read QPS swap it for Netty/Javalin + a
+  routing-aware retrying client.*
+- **Classic + Flink keep Redis.** Classic is Redis-native. Flink *could* in principle serve from its keyed
+  RocksDB state, but Flink Queryable State is deprecated as of 1.18 (the version we run) — so the engine is
+  deliberately built to **write-through to Redis** on the authoritative path (`RouterFn`) and read from the
+  mirror. Same ~1.66 ms as classic, same Redis dependency.
+
+`redis-benchmark` raw-GET ceiling for reference (single key, no snapshot hash, no app hop): SET 86k/s, GET
+77k/s, HSET 82k/s, p50 ~0.3 ms — the ~1.66 ms above is the full `HGETALL` of the snapshot hash across the bridge.
 
 ---
 
@@ -393,18 +414,24 @@ disk-backed authoritative store (IQ unused). Which wins depends on whether you t
 | **single-instance ops** | Temporal: query / **reset / terminate any one workflow** + history UI | Temporal (unchanged) | domain **cancel (suppress) ✓**; no out-of-band reset/terminate or per-key history UI |
 | **bulk / fleet-wide suppress** | Batch Operation — O(N) **durable** signals (~1.6 h / 1M @ measured bound) | Temporal (unchanged) | **broadcast → keyed-state fan-out** (wired via `POST /suppress`; measured **~4.7 s / 1M**) |
 | **RAM wall on the source of truth** | yes (Redis-bound) | **no** (RocksDB) | **no** (disk/heap) |
-| **state-build throughput (1 partition)** | ~1,950/s (measured) | **~2,058/s (measured)** — wash, EOS-commit-bound | in-stream (not the bound) |
+| **state-build throughput** | ~1,950/s (1 part) → **~2,865/s** (1 builder, 2 part) measured | **~2,058/s** (1 part) → **~5,263/s** (2 inst, 2 part) measured — wash per instance, EOS-commit-bound, **scales ~linearly with partitions/instances** | in-stream (not the bound), ~2k/s per partition |
 | **recovery re-eval** | **replay + over-emit** (Redis dual-write, not atomic w/ offset) | **emit-exact** (state+offset one EOS txn) | **emit-exact** (EOS checkpoint) |
-| **hot-path reads** | **Redis (fast, always-up)** | IQ (local µs, fragile) *or* Redis cache | needs Redis write-through |
+| **hot-path reads** | Redis `HGETALL` **1.66 ms** (always-up, Redis-native) | **IQ (RocksDB) 1.53 ms — no Redis**; HA-tuned (KIP-535 stale reads + serve-from-standby, validated through a node kill), **latency-neutral vs Redis**; POC `com.sun` HTTP shim needs hardening for prod QPS | Redis write-through **1.66 ms** (== classic; Queryable State deprecated in 1.18, so it mirrors to Redis) |
 | **earns its complexity for** | nothing — it's the simple default | member-state > economical RAM, Redis kept | **dispatch burst + operational consolidation + RAM wall** |
 
 **Bottom line.** KStreams earns its keep on the **state tier** — disk-backed authoritative state (no RAM wall) with
-**emit-exact recovery** (no re-eval storm) — behind a Redis hot cache; it leaves the dispatch bound, the throughput
-(~2,000/s per partition, a measured wash), and the component count untouched. **Flink earns the most**: it gets *both*
+**emit-exact recovery** (no re-eval storm) — and, as the campaign confirmed, it can serve the **hot-path read
+straight from its own RocksDB state via IQ, dropping Redis entirely** (1.53 ms, latency-neutral vs Redis, and
+HA through a node kill once the stale-read + standby tuning is on). It leaves the dispatch bound, the throughput
+(~2,000/s per partition, a measured wash that scales ~linearly with partitions/instances — 2 inst/2 part
+folded ~5,263/s), and the component count untouched. **Flink earns the most**: it gets *both*
 of KStreams' state-tier wins (disk-backed state + EOS emit-exact recovery) **and** additionally **shrinks the
 operational footprint** (≈7 processes → 1, dropping Temporal + the Postgres dynamic state + the Debezium/outbox tier)
-and **removes a hard scale bound** (Temporal's ~178/s start path). The trade is
+and **removes a hard scale bound** (Temporal's ~178/s start path). The one thing Flink does *not* get is the
+no-Redis read: Queryable State is deprecated in 1.18, so Flink write-throughs to Redis for hot-path reads (~1.66 ms,
+same as classic) — **only KStreams drops Redis.** The trade is
 real — you give up Temporal's **per-workflow durability, isolation, and interactive control** (*The Temporal trade*
 above) — but because the same canonical events flow either way, **observability stays good**. So when the RAM / burst
 / dispatch math binds, the bigger lever is **Flink, not KStreams** — it attacks the dispatch ceiling and the service
-sprawl at once, with Redis retained purely as the fast hot-read cache.
+sprawl at once (keeping Redis as the fast hot-read mirror); KStreams is the pick when dropping the Redis read tier
+is itself the goal.

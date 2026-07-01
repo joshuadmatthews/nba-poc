@@ -7,6 +7,14 @@ Interactive-Query reads) beats the classic snapshot-builder + Redis at scale —
 Harness (reusable): `loadgen.py` (producer), `loadtest-clean.sh` (isolated drain), `loadtest-isolated.sh`
 (no-flywheel write rate), `loadtest-reads.sh` + `iqprobe.py` (reads under write load).
 
+> **⚠️ UPDATE (cross-flavor campaign — see §8).** Sections 2/4/6b and the original Verdict below concluded
+> *"IQ is a liability, keep Redis, don't drop it."* That was correct **for the IQ surface as built** (untuned:
+> redirect-to-dead-active → 100% 500 during rebalance). A later clean-start campaign **tuned IQ for
+> availability** (KIP-535 stale reads + serve-from-standby) and re-measured on a 2-partition stack. The verdict
+> flipped: **IQ reads are latency-neutral vs Redis (1.53 vs 1.66 ms) and stay up through a node kill — so
+> KStreams *can* drop Redis.** §8 has the current numbers and supersedes the read-surface conclusions below.
+> The state/RAM-wall/burst findings (§3/§7) are unchanged.
+
 ## Methodology notes (what was wrong before it was right)
 - **The first pass was invalid.** `rpk topic produce` from a piped stdin batches the whole stream into one
   produce request that exceeds Redpanda's `kafka_batch_max_bytes` (1 MiB) → `MESSAGE_TOO_LARGE`; only ~40 of
@@ -187,18 +195,78 @@ N-way parallelism turns ~50 min into minutes and keeps the live-fact path respon
 case for KStreams/Flink that the at-this-scale latency/throughput numbers (sections 1–2) deliberately did not
 make.
 
-## Verdict (evidence-based)
-- **At this scale: keep Redis.** Faster reads (10×), concurrency-safe, independent/always-up, no throughput
-  disadvantage, far less memory. The KStreams complexity buys nothing here. (Confirms the earlier rollback.)
+## 8. Cross-flavor campaign — clean-start, 2 partitions, per-flavor read model (supersedes §2/§4/§6b read verdict)
+Goal: a **published-quality** characterization of each flavor's hot path, with proper hygiene. Two method fixes
+over the earlier passes:
+- **Clean start per test** — every run begins on empty topics/DLQs and a flushed Redis (compacted state topics
+  delete+recreated, data topics trimmed to the edge, `flushdb`), so no run inherits another's backlog or cache.
+- **2 partitions, 2 instances** — the co-partitioned keying (`create-topics.ps1`, members hash to stable
+  partitions) run at real parallelism, not the single-partition per-instance floor of §1/§6.
+- **App-representative reads over the podman bridge** — the read probe does the *full* `HGETALL` of the
+  snapshot hash (classic) or the IQ HTTP `GET /snapshot/{id}` (KStreams), each across the bridge, one network
+  hop — the way the app actually reads. (This supersedes §2's 0.25 ms, which was a raw single-key
+  `redis-benchmark` GET, not the app's HGETALL over the network.)
+
+### The IQ availability fix (why the §4 "liability" verdict flipped)
+§4's 100% HTTP 500 during rebalance/recovery was **not** the RocksDB store failing — it was `IqServer`
+redirecting reads to the *active* host for a key even when that host had just died. Two changes make the read
+surface ride through a failover (`IqServer.java:78,88`):
+- **serve-from-standby** — a pod that holds a **standby** replica of a key answers from its warm copy instead
+  of 307-redirecting to a possibly-dead active (`md.standbyHosts().contains(self)`), backed by
+  `num.standby.replicas`;
+- **KIP-535 stale reads** — `enableStaleStores()` lets a pod serve a partition that is still *restoring*
+  (slightly stale) rather than throwing `InvalidStateStoreException`.
+
+Validated: **200 reads straight through a rolling instance kill**, zero 500s. The store was always fine; the
+availability bug was the redirect target.
+
+### Per-flavor result (clean-start, 2 part)
+| flavor | state-build fold | hot-path read store | read p50 (p95) | Redis needed? |
+|---|---|---|---|---|
+| **classic** | ~2,865/s (1 builder, 2 part) | Redis `HGETALL nba:snapshot:{id}` | **1.66 ms** (~14.4k rps) | **yes** (authoritative read store) |
+| **KStreams** | **~5,263/s** (2 inst, 2 part) | IQ → local RocksDB (HTTP) | **1.53 ms** (3.12 ms) | **no** — served from own state |
+| **Flink** | ~2k/s per partition (in-stream) | Redis write-through mirror (`RouterFn`) | **1.66 ms** (== classic) | **yes** — Queryable State deprecated in 1.18 → mirrors to Redis |
+
+### Findings
+- **Hot-path read latency is a wash (~1.5–1.7 ms across all three)** measured apples-to-apples over the bridge.
+  The read *store* is the differentiator, not the read *speed*.
+- **KStreams uniquely drops Redis.** IQ reads are latency-neutral vs Redis (1.53 vs 1.66 ms) and now HA through
+  a node kill — so the classic Redis read tier can be removed entirely on this flavor. *Caveat: the read
+  surface is still the POC `com.sun` `HttpServer` (single-threaded, §2's ~3.5× degradation at read-concurrency
+  10 stands). The **availability** problem is fixed; the **concurrency** problem needs a real server
+  (Netty/Javalin) + routing-aware retrying client for production read QPS. The state store is production-grade;
+  the HTTP shim is not.*
+- **Flink cannot drop Redis** despite holding the same keyed RocksDB state: Flink Queryable State is deprecated
+  as of 1.18 (our version), so the engine is deliberately built to **write-through to Redis** on the
+  authoritative path (`RouterFn`, `Conf.redisWriteThrough`) and read from the mirror — ~1.66 ms, same as
+  classic. This directly answers "same RocksDB hot path for Flink too?": conceptually yes, but the supported
+  path in 1.18 is the Redis mirror, so **only KStreams gets the no-Redis read**.
+- **Fold throughput scales ~linearly with partitions/instances** and remains EOS-commit-bound per instance
+  (~2–2.9k/s): classic 1 builder / 2 part ~2,865/s; KStreams 2 inst / 2 part ~5,263/s (~2,630/s each). Not a
+  single-instance speedup — a partition/parallelism play, consistent with §6/§7.
+
+**Net for the published POC:** the read latency claim in §2 ("Redis ~10× faster") does **not** hold
+app-representatively — it's a wash. The real read-model story per flavor is: **classic = Redis (native),
+KStreams = IQ/RocksDB (no Redis, HA-tuned, latency-neutral), Flink = Redis write-through (QS deprecated).**
+
+## Verdict (evidence-based; read-surface bullets updated per §8)
+- **~~At this scale: keep Redis. Faster reads (10×)…~~** — *superseded by §8.* App-representative reads are a
+  **wash** (Redis 1.66 ms vs IQ 1.53 ms), not 10×; the §2 0.25 ms was a raw `redis-benchmark` GET, not the
+  app's HGETALL over the network. Redis is still the right default for **classic** (native) and required for
+  **Flink** (Queryable State deprecated in 1.18 → write-through), but **KStreams can drop Redis**: IQ is
+  latency-neutral and HA once tuned (stale reads + standby). Keep Redis where the flavor needs it; it is no
+  longer a *latency* argument.
 - **KStreams/Flink "takes the lead" specifically on STATE-SIZE economics and write-path scaling, NOT
   latency/throughput.** Redis is RAM-bound with a hard wall (demonstrated: OOM at 55k members / 256MB →
   system-wide write failure); RocksDB spills to disk and shards per-partition with no central write
   bottleneck. The crossover is "member state exceeds economical RAM" or "write QPS saturates one Redis," not
   "we want lower latency."
-- **If KStreams/Flink is adopted, the read surface must be productionized** (multi-threaded/Netty server,
-  standby replicas for read availability during rebalance/recovery, routing-aware client) or it's a liability
-  vs Redis — and the engine must not depend on Redis (the idmap coupling is what made Redis's OOM take it
-  down).
+- **If KStreams drops Redis, the read surface needs two fixes — one now done, one still open (§8).** The
+  **availability** half is fixed: standby replicas + KIP-535 stale reads keep IQ serving through a node
+  kill (validated, 200 reads clean). The **concurrency** half remains: the POC `com.sun` HttpServer is
+  single-threaded (degrades ~3.5× at C=10) — production read QPS wants a Netty/Javalin server + routing-aware
+  retrying client. Also: the engine must not hard-depend on Redis for anything else (the `idmap` coupling is
+  what let Redis's OOM take the stream app down). Flink keeps Redis regardless (QS deprecated in 1.18).
 - **Across the full spine (section 6): the compute stages are not the problem — the state store and the
   workflow engine are.** Snapshot/rules/router all sit in the low-thousands/s on classic and ~20k/s on Flink;
   the two things that actually bound the system are (a) Redis's central-RAM wall on the hot store and (b)
