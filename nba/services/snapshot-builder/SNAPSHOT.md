@@ -82,6 +82,15 @@ the snapshot-builder folds the same facts a live journey emits (scores from the 
 states/dispositions/completions/milestones the state machine emits). Watch the field count grow as distinct
 keys accumulate while each key stays single-valued.
 
+Each stage below is shown twice: a **concise family view** (what changed), then the **full literal snapshot** —
+every field with its complete key and JSON value, exactly as it lives in the store. The store record is the
+Redis hash `nba:snapshot:{nbaId}` (`HGETALL`); the `nba.snapshots` topic message is that same hash wrapped by
+`buildSnapshotJson` (`{nbaId, entityType, entityId, correlationId, updatedTs, facts:{key→fv}}`, `fact:` prefix
+stripped, a fresh `correlationId` per build). Every fact value is the **4-field fv** `{value, valueType,
+eventTs, source}` and nothing more — note the disposition below keeps only those four; its richer bus fields
+(`state`, `channel`, `contentKey`, `trackingId`, `correlationId`) ride the message, not the snapshot. `nba.score.*`
+is flattened to its bare numeric `.score` (valueType `DOUBLE`).
+
 ### Stage 1 — newly accreted, scored, ready for the forced onboarding email  (14 fields)
 The member's inbound attributes are in (7 kept; `daysSinceLogin` dropped by the lean-filter), and the engine has
 scored the candidate actions. `action_plan_welcome` (the forced onboarding action) is top-scored across its
@@ -91,6 +100,55 @@ operator (7):    diabetic=true isDNC=false respondedToOutreach=true hraCompleted
                  pcpSelected=false registeredForPortal=false totalThisWeek=0      (daysSinceLogin DROPPED)
 score (7):       nba.score.action_plan_welcome.{email=19.74, sms=19.06, push=18.06, voice=14.43}   ← onboarding, top
                  nba.score.action_reengage.{email=17.34, push=15.02, sms=14.62}
+```
+
+**Full literal — store form** (`HGETALL nba:snapshot:nba_af77df084981`; 4 meta + 14 fact fields):
+```
+__entityType                               OPERATOR
+__entityId                                 jdemo1
+__nbaId                                    nba_af77df084981
+__updatedTs                                1782749560524
+fact:operator.profile.diabetic             {"value":true,"valueType":"BOOLEAN","eventTs":1782749551200,"source":"seed"}
+fact:operator.profile.isDNC                {"value":false,"valueType":"BOOLEAN","eventTs":1782749551200,"source":"seed"}
+fact:operator.activity.respondedToOutreach {"value":true,"valueType":"BOOLEAN","eventTs":1782749551200,"source":"seed"}
+fact:operator.activity.hraCompleted        {"value":false,"valueType":"BOOLEAN","eventTs":1782749551200,"source":"seed"}
+fact:operator.activity.pcpSelected         {"value":false,"valueType":"BOOLEAN","eventTs":1782749551200,"source":"seed"}
+fact:operator.activity.registeredForPortal {"value":false,"valueType":"BOOLEAN","eventTs":1782749551200,"source":"seed"}
+fact:operator.comms.totalThisWeek          {"value":0,"valueType":"LONG","eventTs":1782749551200,"source":"seed"}
+fact:nba.score.action_plan_welcome.email   {"value":19.74,"valueType":"DOUBLE","eventTs":1782749559800,"source":"journey-scorer"}
+fact:nba.score.action_plan_welcome.sms     {"value":19.06,"valueType":"DOUBLE","eventTs":1782749559800,"source":"journey-scorer"}
+fact:nba.score.action_plan_welcome.push    {"value":18.06,"valueType":"DOUBLE","eventTs":1782749559800,"source":"journey-scorer"}
+fact:nba.score.action_plan_welcome.voice   {"value":14.43,"valueType":"DOUBLE","eventTs":1782749559800,"source":"journey-scorer"}
+fact:nba.score.action_reengage.email       {"value":17.34,"valueType":"DOUBLE","eventTs":1782749559800,"source":"journey-scorer"}
+fact:nba.score.action_reengage.push        {"value":15.02,"valueType":"DOUBLE","eventTs":1782749559800,"source":"journey-scorer"}
+fact:nba.score.action_reengage.sms         {"value":14.62,"valueType":"DOUBLE","eventTs":1782749559800,"source":"journey-scorer"}
+```
+
+**Full literal — wire form** (the `nba.snapshots` message, key `nba_af77df084981` — same facts, `fact:` stripped):
+```json
+{
+  "nbaId": "nba_af77df084981",
+  "entityType": "OPERATOR",
+  "entityId": "jdemo1",
+  "correlationId": "b7c1f0a2-9d3e-4a11-8f6c-1e2d3a4b5c6d",
+  "updatedTs": 1782749560524,
+  "facts": {
+    "operator.profile.diabetic":             {"value": true,  "valueType": "BOOLEAN", "eventTs": 1782749551200, "source": "seed"},
+    "operator.profile.isDNC":                {"value": false, "valueType": "BOOLEAN", "eventTs": 1782749551200, "source": "seed"},
+    "operator.activity.respondedToOutreach": {"value": true,  "valueType": "BOOLEAN", "eventTs": 1782749551200, "source": "seed"},
+    "operator.activity.hraCompleted":        {"value": false, "valueType": "BOOLEAN", "eventTs": 1782749551200, "source": "seed"},
+    "operator.activity.pcpSelected":         {"value": false, "valueType": "BOOLEAN", "eventTs": 1782749551200, "source": "seed"},
+    "operator.activity.registeredForPortal": {"value": false, "valueType": "BOOLEAN", "eventTs": 1782749551200, "source": "seed"},
+    "operator.comms.totalThisWeek":          {"value": 0,     "valueType": "LONG",    "eventTs": 1782749551200, "source": "seed"},
+    "nba.score.action_plan_welcome.email":   {"value": 19.74, "valueType": "DOUBLE",  "eventTs": 1782749559800, "source": "journey-scorer"},
+    "nba.score.action_plan_welcome.sms":     {"value": 19.06, "valueType": "DOUBLE",  "eventTs": 1782749559800, "source": "journey-scorer"},
+    "nba.score.action_plan_welcome.push":    {"value": 18.06, "valueType": "DOUBLE",  "eventTs": 1782749559800, "source": "journey-scorer"},
+    "nba.score.action_plan_welcome.voice":   {"value": 14.43, "valueType": "DOUBLE",  "eventTs": 1782749559800, "source": "journey-scorer"},
+    "nba.score.action_reengage.email":       {"value": 17.34, "valueType": "DOUBLE",  "eventTs": 1782749559800, "source": "journey-scorer"},
+    "nba.score.action_reengage.push":        {"value": 15.02, "valueType": "DOUBLE",  "eventTs": 1782749559800, "source": "journey-scorer"},
+    "nba.score.action_reengage.sms":         {"value": 14.62, "valueType": "DOUBLE",  "eventTs": 1782749559800, "source": "journey-scorer"}
+  }
+}
 ```
 
 ### Stage 2 — onboarding completed, second action in flight  (19 fields, +5)
@@ -105,6 +163,34 @@ completion (1):  nba.completion.action_plan_welcome          = true             
 milestone (1):   nba.milestone.milestone_reached             = <ts>             ← durable latch
 ```
 
+**Full literal — store form** (`HGETALL`; 4 meta + 19 fact fields — the Stage-1 14 unchanged, +5 lifecycle keys):
+```
+__entityType                               OPERATOR
+__entityId                                 jdemo1
+__nbaId                                    nba_af77df084981
+__updatedTs                                1782749625000
+fact:operator.profile.diabetic             {"value":true,"valueType":"BOOLEAN","eventTs":1782749551200,"source":"seed"}
+fact:operator.profile.isDNC                {"value":false,"valueType":"BOOLEAN","eventTs":1782749551200,"source":"seed"}
+fact:operator.activity.respondedToOutreach {"value":true,"valueType":"BOOLEAN","eventTs":1782749551200,"source":"seed"}
+fact:operator.activity.hraCompleted        {"value":false,"valueType":"BOOLEAN","eventTs":1782749551200,"source":"seed"}
+fact:operator.activity.pcpSelected         {"value":false,"valueType":"BOOLEAN","eventTs":1782749551200,"source":"seed"}
+fact:operator.activity.registeredForPortal {"value":false,"valueType":"BOOLEAN","eventTs":1782749551200,"source":"seed"}
+fact:operator.comms.totalThisWeek          {"value":0,"valueType":"LONG","eventTs":1782749551200,"source":"seed"}
+fact:nba.score.action_plan_welcome.email   {"value":19.74,"valueType":"DOUBLE","eventTs":1782749559800,"source":"journey-scorer"}
+fact:nba.score.action_plan_welcome.sms     {"value":19.06,"valueType":"DOUBLE","eventTs":1782749559800,"source":"journey-scorer"}
+fact:nba.score.action_plan_welcome.push    {"value":18.06,"valueType":"DOUBLE","eventTs":1782749559800,"source":"journey-scorer"}
+fact:nba.score.action_plan_welcome.voice   {"value":14.43,"valueType":"DOUBLE","eventTs":1782749559800,"source":"journey-scorer"}
+fact:nba.score.action_reengage.email       {"value":17.34,"valueType":"DOUBLE","eventTs":1782749559800,"source":"journey-scorer"}
+fact:nba.score.action_reengage.push        {"value":15.02,"valueType":"DOUBLE","eventTs":1782749559800,"source":"journey-scorer"}
+fact:nba.score.action_reengage.sms         {"value":14.62,"valueType":"DOUBLE","eventTs":1782749559800,"source":"journey-scorer"}
+fact:nba.actionstate.action_plan_welcome.email  {"value":"HARD_COMPLETED","valueType":"STRING","eventTs":1782749623000,"source":"temporal"}
+fact:nba.actionstate.action_reengage.push       {"value":"IN_PROCESS","valueType":"STRING","eventTs":1782749624000,"source":"temporal"}
+fact:nba.disposition.action_plan_welcome.email  {"value":"LinkClicked","valueType":"STRING","eventTs":1782749622500,"source":"action-layer"}
+fact:nba.completion.action_plan_welcome         {"value":"true","valueType":"BOOL","eventTs":1782749623500,"source":"action-router"}
+fact:nba.milestone.milestone_reached            {"value":"1782749623800","valueType":"LONG","eventTs":1782749623800,"source":"action-router"}
+```
+(The 14 Stage-1 fields are **byte-identical** — operator attributes and scores didn't change; the journey advanced via the *lifecycle* keys. Only the 5 new `nba.actionstate/disposition/completion/milestone` keys grew the count 14→19.)
+
 ### Stage 3 — whole set completed  (22 fields, +3)
 Both actions reached a terminal state; both goals + a second milestone latched. Still 7 scores (one per
 action×channel — no pile-up); the terminal states + latches are permanent. The full journey is reconstructable
@@ -117,3 +203,34 @@ disposition (2): action_plan_welcome.email = LinkClicked      action_reengage.pu
 milestone (2):   milestone_reached   milestone_assessed       (durable latches)
 completion (2):  action_plan_welcome=true   action_reengage=true
 ```
+
+**Full literal — store form** (`HGETALL`; 4 meta + 22 fact fields — Stage-2 19 + 3 new lifecycle keys, `action_reengage.push` state updated in place `IN_PROCESS`→`HARD_COMPLETED`):
+```
+__entityType                               OPERATOR
+__entityId                                 jdemo1
+__nbaId                                    nba_af77df084981
+__updatedTs                                1782749705000
+fact:operator.profile.diabetic             {"value":true,"valueType":"BOOLEAN","eventTs":1782749551200,"source":"seed"}
+fact:operator.profile.isDNC                {"value":false,"valueType":"BOOLEAN","eventTs":1782749551200,"source":"seed"}
+fact:operator.activity.respondedToOutreach {"value":true,"valueType":"BOOLEAN","eventTs":1782749551200,"source":"seed"}
+fact:operator.activity.hraCompleted        {"value":false,"valueType":"BOOLEAN","eventTs":1782749551200,"source":"seed"}
+fact:operator.activity.pcpSelected         {"value":false,"valueType":"BOOLEAN","eventTs":1782749551200,"source":"seed"}
+fact:operator.activity.registeredForPortal {"value":false,"valueType":"BOOLEAN","eventTs":1782749551200,"source":"seed"}
+fact:operator.comms.totalThisWeek          {"value":0,"valueType":"LONG","eventTs":1782749551200,"source":"seed"}
+fact:nba.score.action_plan_welcome.email   {"value":19.74,"valueType":"DOUBLE","eventTs":1782749559800,"source":"journey-scorer"}
+fact:nba.score.action_plan_welcome.sms     {"value":19.06,"valueType":"DOUBLE","eventTs":1782749559800,"source":"journey-scorer"}
+fact:nba.score.action_plan_welcome.push    {"value":18.06,"valueType":"DOUBLE","eventTs":1782749559800,"source":"journey-scorer"}
+fact:nba.score.action_plan_welcome.voice   {"value":14.43,"valueType":"DOUBLE","eventTs":1782749559800,"source":"journey-scorer"}
+fact:nba.score.action_reengage.email       {"value":17.34,"valueType":"DOUBLE","eventTs":1782749559800,"source":"journey-scorer"}
+fact:nba.score.action_reengage.push        {"value":15.02,"valueType":"DOUBLE","eventTs":1782749559800,"source":"journey-scorer"}
+fact:nba.score.action_reengage.sms         {"value":14.62,"valueType":"DOUBLE","eventTs":1782749559800,"source":"journey-scorer"}
+fact:nba.actionstate.action_plan_welcome.email  {"value":"HARD_COMPLETED","valueType":"STRING","eventTs":1782749623000,"source":"temporal"}
+fact:nba.actionstate.action_reengage.push       {"value":"HARD_COMPLETED","valueType":"STRING","eventTs":1782749702000,"source":"temporal"}
+fact:nba.disposition.action_plan_welcome.email  {"value":"LinkClicked","valueType":"STRING","eventTs":1782749622500,"source":"action-layer"}
+fact:nba.disposition.action_reengage.push       {"value":"Delivered","valueType":"STRING","eventTs":1782749701500,"source":"action-layer"}
+fact:nba.completion.action_plan_welcome         {"value":"true","valueType":"BOOL","eventTs":1782749623500,"source":"action-router"}
+fact:nba.completion.action_reengage             {"value":"true","valueType":"BOOL","eventTs":1782749702500,"source":"action-router"}
+fact:nba.milestone.milestone_reached            {"value":"1782749623800","valueType":"LONG","eventTs":1782749623800,"source":"action-router"}
+fact:nba.milestone.milestone_assessed           {"value":"1782749702800","valueType":"LONG","eventTs":1782749702800,"source":"action-router"}
+```
+This one object is the **whole journey, reconstructable**: each action's high-water mark (its terminal `actionstate`), how it was engaged (the `disposition`), what it scored (`nba.score.*`, still 7 — no pile-up), and which goals + milestones latched (`completion.*` / `milestone.*`). Nothing fell off; every key holds its single latest value.
