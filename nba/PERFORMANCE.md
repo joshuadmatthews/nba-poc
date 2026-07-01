@@ -118,13 +118,32 @@ start path) are.** The shape the testing converges on is a **hybrid**:
 - **disk-backed partitioned compute** (KStreams/Flink) to absorb the **~8M-scores/day bulk burst** — ~40–53 min
   of serial backlog on the classic path (blocking live facts) vs **minutes** when partitioned across slots/pods —
   and to scale member-state past economical RAM;
-- **Redis kept as the fast, always-up hot-path read cache** (because IQ fails), fed by write-through and ideally
-  **TTL'd to hot members** so the mirror doesn't re-create the RAM wall;
-- **Temporal scaled out** (more history shards / parallel starts) for the daily action-dispatch spike.
+- **the hot-path read** stays on Redis for classic (native) and Flink (Queryable State deprecated in 1.18 →
+  write-through mirror); **KStreams can drop Redis entirely** — the cross-flavor campaign (§8) showed the
+  HA-tuned IQ surface reads latency-neutral vs Redis (1.53 vs 1.66 ms) and rides through a node kill. Where
+  Redis is kept, TTL it to hot members so the mirror doesn't re-create the RAM wall;
+- **Temporal scaled out** (more history shards / parallel starts) for the daily action-dispatch spike — *unless*
+  you move to Flink, which removes the Temporal start path altogether.
 
-**Classic stays the right call** until member-state exceeds economical RAM, or write QPS saturates one Redis, or
-the daily burst can't drain in time — at which point the disk-backed engine earns its complexity, with Redis
-retained purely as the read surface.
+### Which flavor for prod (the decision rule)
+- **Classic** — the default. Stays the right call until member-state exceeds economical RAM, or write QPS
+  saturates one Redis, or the daily burst can't drain in time. Simplest to operate; Redis-native reads.
+- **KStreams** — the pick when you must **keep Temporal's per-workflow durability/isolation/interactive control**
+  but the pain is the **Redis RAM/read tier**. It's the *only* flavor that drops Redis (HA-tuned IQ), shedding
+  the RAM wall and the read-cache infra without touching the dispatch layer. Cost: harden the IQ HTTP surface
+  (Netty/Javalin + routing-aware client) for prod read QPS; the state store itself is production-grade.
+- **Flink** — the pick when the goal is to **bypass Temporal**. It's the bigger lever: it gets *both* of
+  KStreams' state-tier wins **and** collapses ~7 processes → 1 (drops Temporal + the Postgres dynamic state +
+  the Debezium/outbox tier) **and** removes the ~178/s Temporal start bound (bulk-suppress ~4.7 s/1M vs ~1.6 h).
+  It attacks the dispatch ceiling, the RAM wall, and the component count in one move — and keeps Redis as the
+  read mirror (less to productionize than KStreams' Redis-free path, since Redis reads are already prod-grade).
+  Cost: you give up Temporal's per-workflow reset/terminate/query + history UI (domain suppress/cancel *is*
+  wired in-stream; see §8's *Temporal trade*).
+
+**Net:** the campaign made **KStreams the best "keep Temporal, drop Redis" option**, but it did **not** dethrone
+**Flink as the answer to "bypass Temporal"** — the two win on different axes and are not competing for the same
+slot. When the RAM / burst / dispatch math binds and Temporal's per-workflow control isn't a hard requirement,
+**Flink is the preferred prod target.**
 
 ---
 
