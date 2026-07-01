@@ -72,14 +72,20 @@ final class IqServer {
             if (md == null || md.equals(KeyQueryMetadata.NOT_AVAILABLE)) {
                 respond(ex, 503, "{\"error\":\"state not available (rebalancing)\"}", true); return;
             }
-            HostInfo owner = md.activeHost();
-            if (!owner.equals(self)) {
+            // Serve LOCALLY if we're the active OR a standby for this key — a standby-holding pod answers from its
+            // warm copy (KIP-535 stale read) instead of bouncing to a possibly-dead active, so reads stay available
+            // through a failover/rebalance at the cost of slightly-stale data. Only redirect when we hold no copy.
+            boolean mine = md.activeHost().equals(self) || md.standbyHosts().contains(self);
+            if (!mine) {
+                HostInfo owner = md.activeHost();
                 ex.getResponseHeaders().set("Location", "http://" + owner.host() + ":" + owner.port() + prefix + nbaId);
                 respond(ex, 307, "", false); return;
             }
 
-            ReadOnlyKeyValueStore<String, String> store =
-                    streams.store(StoreQueryParameters.fromNameAndType(storeName, QueryableStoreTypes.keyValueStore()));
+            // enableStaleStores(): serve even while the store is RESTORING (a pod promoting a partition after a peer
+            // died reads its partially-restored/standby copy stale rather than throwing) — the availability win.
+            ReadOnlyKeyValueStore<String, String> store = streams.store(
+                    StoreQueryParameters.fromNameAndType(storeName, QueryableStoreTypes.<String, String>keyValueStore()).enableStaleStores());
             String stored = store.get(nbaId);
             if (stored == null) { respond(ex, 404, "{\"error\":\"not found\",\"nbaId\":\"" + nbaId + "\"}", true); return; }
             respond(ex, 200, transform.apply(nbaId, stored), true);
