@@ -5,7 +5,7 @@
   Consumes nba.activations and drives ChannelAction workflows on ais-nba-temporal.
 #>
 [CmdletBinding()]
-param([switch]$Build, [int]$DebounceSeconds = 60, [string]$FaultInject, [int]$Concurrency = 1)   # -FaultInject: DLQ test hook; -Concurrency: parallel workflow-starts (1 = legacy serial)
+param([switch]$Build, [int]$DebounceSeconds = 60, [string]$FaultInject, [int]$Concurrency = 64)   # -Concurrency: parallel workflow-starts (64 = the ~178/s single-node server plateau, see loadtest-results.md; 1 = legacy serial)
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 $NAME = 'ais-nba-temporal-worker'

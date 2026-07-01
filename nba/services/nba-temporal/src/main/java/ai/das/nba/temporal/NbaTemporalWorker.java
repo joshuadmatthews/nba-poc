@@ -118,6 +118,13 @@ public class NbaTemporalWorker {
         thr.setDaemon(true);
         thr.start();
 
+        // Operator ACTION_SUPPRESS is an ACTION-LEVEL priority signal: ride the low-volume nba.definitions broadcast
+        // (own group) so a suppress fires immediately, NOT stuck behind the member.facts CREATE backlog the bridge
+        // drains. Idempotent SuppressionWorkflow start dedups the per-instance broadcast copies.
+        Thread sup = new Thread(() -> runSuppressFeed(bootstrap, defsTopic, client), "suppress-feed");
+        sup.setDaemon(true);
+        sup.start();
+
         // The bridge now consumes ROUTER DECISIONS off nba.member.facts (kind=router), not nba.activations.
         // nba.activations carries only the state machine's own DISPATCH/CANCEL (emitted via the outbox, read
         // by the action layer). Router CREATE/SUPPRESS are member-level facts, so they ride member.facts.
@@ -211,6 +218,64 @@ public class NbaTemporalWorker {
         }
     }
 
+    // nba.definitions -> operator ACTION_SUPPRESS flags are ACTION-LEVEL PRIORITY signals. They ride the low-volume
+    // definitions broadcast (own consumer group -> EVERY worker instance sees every flag), so an operator suppress
+    // fires immediately instead of queuing behind the member.facts CREATE backlog the member-keyed bridge drains.
+    // On a fresh suppress (value=true, eventTs after this worker started -> skips the compacted-topic replay), fan the
+    // cancel out to the in-flight workflows via the SuppressionWorkflow. The idempotent start (target+eventTs,
+    // USE_EXISTING) collapses the N broadcast copies across worker instances into ONE batch.
+    static void runSuppressFeed(String bootstrap, String defsTopic, WorkflowClient client) {
+        final long startTime = System.currentTimeMillis();
+        final java.util.Map<String, Long> fired = new java.util.concurrent.ConcurrentHashMap<>();  // target -> last eventTs fired
+        KafkaConsumer<String, String> consumer = new KafkaConsumer<>(
+                consumerProps(bootstrap, "nba-temporal-suppress-" + java.util.UUID.randomUUID()));
+        consumer.subscribe(List.of(defsTopic));
+        log.info("suppress feed up: " + defsTopic + " (ACTION_SUPPRESS -> SuppressionWorkflow, priority)");
+        while (true) {
+            ConsumerRecords<String, String> recs = consumer.poll(Duration.ofMillis(500));
+            for (ConsumerRecord<String, String> r : recs) {
+                try {
+                    String key = r.key() == null ? "" : r.key();
+                    if (!key.startsWith("ACTION_SUPPRESS:") || r.value() == null) continue;
+                    var v = M.readTree(r.value());
+                    String target = key.substring("ACTION_SUPPRESS:".length());
+                    Long last = fired.get(target);
+                    long eventTs = v.path("eventTs").asLong(0);
+                    if (!shouldFanSuppress(v.path("value").asBoolean(false), eventTs, startTime, last == null ? 0L : last))
+                        continue;
+                    fired.put(target, eventTs);
+                    startSuppression(client, v.path("actionId").asText(""), v.path("channel").asText(""), eventTs, "defs");
+                } catch (Exception e) {
+                    log.warn("suppress feed skip: " + e);
+                }
+            }
+        }
+    }
+
+    /** Should an ACTION_SUPPRESS definitions flag trigger a fresh in-flight fan-out? Only a suppress (value=true)
+     *  whose eventTs post-dates this worker's start (so the compacted-topic replay of pre-existing flags is skipped)
+     *  and that hasn't already fired for this target (redelivery dedup). Pure -> unit-testable. */
+    static boolean shouldFanSuppress(boolean suppressed, long eventTs, long startTime, long lastFiredEventTs) {
+        return suppressed && eventTs > startTime && eventTs != lastFiredEventTs;
+    }
+
+    // Fan an operator suppression out to every in-flight workflow for the action via the SuppressionWorkflow (a
+    // Temporal batch op). Idempotent workflowId (target+eventTs, USE_EXISTING) -> concurrent/duplicate triggers
+    // (e.g. the defs broadcast reaching N worker instances) collapse to one batch.
+    static void startSuppression(WorkflowClient client, String actionId, String channel, long eventTs, String via) {
+        if (actionId == null || actionId.isEmpty()) return;
+        String target = (channel == null || channel.isEmpty()) ? actionId : actionId + "." + channel;
+        String swfId = "nba-suppress:" + target + ":" + eventTs;
+        WorkflowOptions sopts = WorkflowOptions.newBuilder()
+                .setTaskQueue(TASK_QUEUE).setWorkflowId(swfId)
+                .setWorkflowIdReusePolicy(WorkflowIdReusePolicy.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE)
+                .setWorkflowIdConflictPolicy(WorkflowIdConflictPolicy.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING)
+                .build();
+        SuppressionWorkflow swf = client.newWorkflowStub(SuppressionWorkflow.class, sopts);
+        WorkflowClient.start(swf::suppress, actionId, channel == null ? "" : channel);
+        log.info("suppress-action (" + via + ") -> " + swfId);
+    }
+
     // nba.member.facts (kind=router) -> start/attach a ChannelAction workflow per (member, action, channel).
     // Router decisions ride member.facts now; we filter to kind=router by HEADER (no body deserialize) and
     // ignore every other member fact (dispositions, states, scores) — those are for the snapshot/ML paths.
@@ -252,21 +317,12 @@ public class NbaTemporalWorker {
                     maybeInjectFault(r.value());                 // test hook: force a DLQ on marked messages
                     Activation act = M.readValue(r.value(), Activation.class);
 
-                    // Operator pull (action-wide, no member) -> fan the suppression out to every in-flight workflow
-                    // for the action via the SuppressionWorkflow (a Temporal batch op). A router DECISION, off the
-                    // same kind=router stream the bridge already consumes — the state machine never tails definitions.
+                    // Operator suppression now rides the ACTION_SUPPRESS flag on the nba.definitions broadcast
+                    // (runSuppressFeed) — an ACTION-LEVEL signal on a low-volume, un-backlogged channel, so it fires
+                    // immediately instead of queuing behind this member.facts CREATE backlog. This member.facts path
+                    // is retained only as a defensive fallback (idempotent start dedups if both ever fire).
                     if ("SUPPRESS_ACTION".equals(act.op)) {
-                        if (act.actionId == null || act.actionId.isEmpty()) return;
-                        String target = (act.channel == null || act.channel.isEmpty()) ? act.actionId : act.actionId + "." + act.channel;
-                        String swfId = "nba-suppress:" + target + ":" + act.eventTs;      // per-event id -> idempotent
-                        WorkflowOptions sopts = WorkflowOptions.newBuilder()
-                                .setTaskQueue(TASK_QUEUE).setWorkflowId(swfId)
-                                .setWorkflowIdReusePolicy(WorkflowIdReusePolicy.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE)
-                                .setWorkflowIdConflictPolicy(WorkflowIdConflictPolicy.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING)
-                                .build();
-                        SuppressionWorkflow swf = client.newWorkflowStub(SuppressionWorkflow.class, sopts);
-                        WorkflowClient.start(swf::suppress, act.actionId, act.channel == null ? "" : act.channel);
-                        log.info("suppress-action -> " + swfId);
+                        startSuppression(client, act.actionId, act.channel, act.eventTs, "router");
                         return;
                     }
 

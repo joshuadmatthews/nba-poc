@@ -487,19 +487,12 @@ public class ActionLibrary {
         // Outbox -> Debezium routes ACTION_SUPPRESS:{target} to the definitions topic; the rules engine + this
         // service's definitions cache pick it up. The in-memory SUPPRESSED / nba:suppressed update on that
         // round-trip (single source of truth), so there's no dual write to drift.
+        // Single write: the ACTION_SUPPRESS flag on the definitions broadcast. It IS the trigger — the temporal
+        // worker's suppress-feed (and the Flink state machine) tail nba.definitions and fan the in-flight cancel out
+        // via the SuppressionWorkflow on the false->true transition. This ACTION-LEVEL signal rides a low-volume
+        // channel, so it fires immediately instead of queuing behind the high-volume member.facts CREATE backlog.
         try (Connection conn = ds.getConnection()) {
-            conn.setAutoCommit(false);
             outbox(conn, DEFS_TOPIC, "ACTION_SUPPRESS:" + target, "action-suppress", M.writeValueAsString(fact));
-            // On a SUPPRESS, also drop a ROUTER fact (kind=router) onto member.facts — the temporal bridge already
-            // consumes router DECISIONS, so the state machine reacts to a decision, not the definitions broadcast. It
-            // fans the pull out to in-flight workflows via the SuppressionWorkflow. Same txn -> no dual-write drift.
-            if (suppressed) {
-                ObjectNode pull = M.createObjectNode();
-                pull.put("op", "SUPPRESS_ACTION"); pull.put("actionId", actionId); pull.put("channel", channel);
-                pull.put("eventTs", fact.get("eventTs").asLong()); pull.put("source", "operator");
-                outbox(conn, MEMBER_FACTS, "ACTION_SUPPRESS:" + target, "router", M.writeValueAsString(pull));
-            }
-            conn.commit();
         }
         log.info("operator " + (suppressed ? "SUPPRESS" : "UNSUPPRESS") + " " + target + " (outbox)");
         c.json(fact);

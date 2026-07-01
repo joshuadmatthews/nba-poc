@@ -318,9 +318,13 @@ NbaChannel='push' AND ExecutionStatus='Running'` Visibility query, exactly what 
 stalling. That's *below* the §3 ~178/s server bound because Temporal's Batch Operation is deliberately RPS-throttled
 to protect the cluster (configurable). At the measured ~17/s a 1M-instance suppress is **~16 h**; even at the generous
 ~178/s bound it's ~1.6 h — versus Flink's **4.7 s**. Two honest caveats from the live run: (1) the `POST /suppress`
-*trigger* (outbox → Debezium → the temporal bridge that starts the `SuppressionWorkflow`) was lagging, so I invoked
-the identical Batch Operation directly to measure the *mechanism*; (2) post-send workflows don't leave `Running` on
-suppress — they emit a CANCEL and await the cancel disposition/TTL — so the wall-clock to fully *drain* exceeds even
+*trigger* was **broken** — the temporal bridge that starts the `SuppressionWorkflow` was ~812k records behind on
+`nba.member.facts` (workflow starts are serial gRPC at `NBA_BRIDGE_CONCURRENCY=1`, ~15/s) and operator suppress rode
+that backlogged member stream, so I invoked the identical Batch Operation directly to measure the *mechanism*. **Now
+fixed:** operator suppress rides the low-volume `nba.definitions` `ACTION_SUPPRESS` broadcast instead (an *action-level*
+priority signal — the same pattern the Flink engine uses), and the bridge concurrency default is raised to 64 (the
+~178/s plateau) so it keeps up. *(2)* post-send workflows don't leave `Running` on suppress — they emit a CANCEL and
+await the cancel disposition/TTL — so the wall-clock to fully *drain* exceeds even
 the signal time. Both make the live gap **wider** than the table, not narrower.
 
 ### KStreams, assuming Redis stays the hot path — what it actually buys

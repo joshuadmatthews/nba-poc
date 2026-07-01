@@ -267,4 +267,16 @@ class NbaTemporalWorkerTest {
         assertEquals(ActionActivitiesImpl.suppressQuery("act_x", null),
                      ActionActivitiesImpl.suppressQuery("act_x", ""));
     }
+
+    // ---- suppress-feed gate: which ACTION_SUPPRESS definitions flags trigger the priority in-flight fan-out -------
+
+    @Test
+    void shouldFanSuppress_onlyFreshTrueFlagsAfterStart() {
+        long start = 1_000L;
+        assertTrue(NbaTemporalWorker.shouldFanSuppress(true, 2_000L, start, 0L), "a fresh suppress after start fires");
+        assertFalse(NbaTemporalWorker.shouldFanSuppress(false, 2_000L, start, 0L), "an unsuppress (value=false) never fires");
+        assertFalse(NbaTemporalWorker.shouldFanSuppress(true, 500L, start, 0L), "compacted replay of a pre-start flag is skipped");
+        assertFalse(NbaTemporalWorker.shouldFanSuppress(true, 2_000L, start, 2_000L), "a redelivered already-fired eventTs is skipped");
+        assertTrue(NbaTemporalWorker.shouldFanSuppress(true, 3_000L, start, 2_000L), "a newer suppress for the same target fires again");
+    }
 }
