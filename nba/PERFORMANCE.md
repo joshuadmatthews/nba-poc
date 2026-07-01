@@ -424,6 +424,13 @@ but IQ is fragile under load/failover (§2). The alternative keeps **Redis as th
 disk-backed authoritative store (IQ unused). Which wins depends on whether you trust IQ at your load.
 
 ### The honest scorecard
+**Premise — the three are logically interchangeable (proven, not assumed).** On a frozen deterministic input,
+`engine-equivalence.sh` diffs each engine's per-member snapshot + eligibility (+ score) against the classic
+Redis golden. Latest run: **classic == KStreams == Flink, 33/33 identical, 0 divergent** (all three snapshots;
+Flink's eligibility vs classic; KStreams materializes classic's eligibility so it's identical by construction).
+So the choice below is purely about **operational properties — not decision quality**; every flavor emits the
+same NBAs.
+
 | | classic | KStreams | Flink |
 |---|---|---|---|
 | **decision-path processes** | ~7 (incl. Temporal worker + server, Debezium) | ~7 (swaps the snapshot store) | **1 job, no Temporal** |
@@ -433,7 +440,7 @@ disk-backed authoritative store (IQ unused). Which wins depends on whether you t
 | **single-instance ops** | Temporal: query / **reset / terminate any one workflow** + history UI | Temporal (unchanged) | domain **cancel (suppress) ✓**; no out-of-band reset/terminate or per-key history UI |
 | **bulk / fleet-wide suppress** | Batch Operation — O(N) **durable** signals (~1.6 h / 1M @ measured bound) | Temporal (unchanged) | **broadcast → keyed-state fan-out** (wired via `POST /suppress`; measured **~4.7 s / 1M**) |
 | **RAM wall on the source of truth** | yes (Redis-bound) | **no** (RocksDB) | **no** (disk/heap) |
-| **state-build throughput** | ~1,950/s (1 part) → **~2,865/s** (1 builder, 2 part) measured | **~2,058/s** (1 part) → **~5,263/s** (2 inst, 2 part) measured — wash per instance, EOS-commit-bound, **scales ~linearly with partitions/instances** | in-stream (not the bound), ~2k/s per partition |
+| **state-build throughput** | ~1,950/s (1 part) → **~2,865/s** (1 builder, 2 part) measured | **~2,058/s** (1 part) → **~5,263/s** (2 inst, 2 part) measured — wash per instance, EOS-commit-bound, **scales ~linearly with partitions/instances** | **~6,780/s at parallelism 2** (~3,400/slot) measured — in-heap keyed state, EOS 10 s checkpoints; fold is *not* the bound, scales with parallelism (sustained-production rate, §8) |
 | **recovery re-eval** | **replay + over-emit** (Redis dual-write, not atomic w/ offset) | **emit-exact** (state+offset one EOS txn) | **emit-exact** (EOS checkpoint) |
 | **hot-path reads** | Redis `HGETALL` **1.66 ms** (always-up, Redis-native) | **IQ (RocksDB) 1.53 ms — no Redis**; HA-tuned (KIP-535 stale reads + serve-from-standby, validated through a node kill), **latency-neutral vs Redis**; POC `com.sun` HTTP shim needs hardening for prod QPS | Redis write-through **1.66 ms** (== classic; Queryable State deprecated in 1.18, so it mirrors to Redis) |
 | **earns its complexity for** | nothing — it's the simple default | member-state > economical RAM, Redis kept | **dispatch burst + operational consolidation + RAM wall** |

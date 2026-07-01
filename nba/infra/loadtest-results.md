@@ -225,7 +225,7 @@ availability bug was the redirect target.
 |---|---|---|---|---|
 | **classic** | ~2,865/s (1 builder, 2 part) | Redis `HGETALL nba:snapshot:{id}` | **1.66 ms** (~14.4k rps) | **yes** (authoritative read store) |
 | **KStreams** | **~5,263/s** (2 inst, 2 part) | IQ → local RocksDB (HTTP) | **1.53 ms** (3.12 ms) | **no** — served from own state |
-| **Flink** | ~2k/s per partition (in-stream) | Redis write-through mirror (`RouterFn`) | **1.66 ms** (== classic) | **yes** — Queryable State deprecated in 1.18 → mirrors to Redis |
+| **Flink** | **~6,780/s at parallelism 2** (~3,400/slot) measured, §8a | Redis write-through mirror (`RouterFn`) | **1.66 ms** (== classic) | **yes** — Queryable State deprecated in 1.18 → mirrors to Redis |
 
 ### Findings
 - **Hot-path read latency is a wash (~1.5–1.7 ms across all three)** measured apples-to-apples over the bridge.
@@ -241,13 +241,45 @@ availability bug was the redirect target.
   authoritative path (`RouterFn`, `Conf.redisWriteThrough`) and read from the mirror — ~1.66 ms, same as
   classic. This directly answers "same RocksDB hot path for Flink too?": conceptually yes, but the supported
   path in 1.18 is the Redis mirror, so **only KStreams gets the no-Redis read**.
-- **Fold throughput scales ~linearly with partitions/instances** and remains EOS-commit-bound per instance
-  (~2–2.9k/s): classic 1 builder / 2 part ~2,865/s; KStreams 2 inst / 2 part ~5,263/s (~2,630/s each). Not a
-  single-instance speedup — a partition/parallelism play, consistent with §6/§7.
+- **Fold throughput scales ~linearly with partitions/instances**, per-instance in the low-thousands: classic
+  1 builder / 2 part ~2,865/s (Redis-HSET-bound); KStreams 2 inst / 2 part ~5,263/s (~2,630/s each,
+  EOS-commit-bound); **Flink ~6,780/s at parallelism 2** (~3,400/slot, in-heap state, EOS 10 s checkpoints —
+  §8a). The fold is a partition/parallelism play on every flavor, never the system bound. Ordering per slot
+  tracks where the state lives: **in-heap (Flink) ≥ local RocksDB (KStreams) > Redis network HSET (classic)** —
+  the closer the state, the faster the fold.
+
+### 8a. The two campaign closers — equivalence proof + measured Flink fold
+Two gaps from the earlier passes, now closed:
+
+**(1) Cross-flavor equivalence — PROVEN.** `engine-equivalence.sh` freezes a deterministic input (journey
+services stopped so `member.facts` stops mutating), replays it through each engine from earliest, and diffs the
+normalized per-member snapshot + eligibility (+ score) against the classic Redis golden. Result:
+**classic == KStreams == Flink, 33/33 identical, 0 divergent** (11 members × Flink-snapshot + Flink-eligibility
++ KStreams-snapshot). This is a real proof, not the live timing-race diagnostic (`engine-parity.sh`). *Test-hygiene
+note: KStreams first came back all-`[skip]` (produced nothing) — its ERROR was a **stale changelog partition
+mismatch** (`nba-decision-engine-*-changelog` left at 1 partition from a prior run, app now expects 2). Deleting
+the stale internal topics + resetting the group fixed it; the equivalence run is only valid once KStreams
+actually emits (no `[skip]`).* Scope: this is the snapshot/eligibility **spine**; KStreams reuses the classic
+Temporal worker unchanged (journey identical by construction), and Flink's own state machine vs Temporal is a
+separate axis exercised by the live diagnostic.
+
+**(2) Flink fold — MEASURED (was inferred).** Froze the journey, gave Flink the box (classic front-ends stopped),
+seeded 600k `member.facts`, ran Flink shadow at parallelism 2 (score off → shared scorer), and sampled every
+10 s. The **committed-offset drain signal was unreliable** — Flink commits checkpoint offsets that diverge from
+the consumer group's committed offset, so the `member.facts` group offset stalled (the known quirk that made
+this un-measurable via Kafka lag before). The **clean signal is the `nba.snapshots.shadow` output rate**, which
+grew linearly at **~6,780 records/s for 5 min** (2.05M snapshots over a 303 s steady window; per-interval
+6,000–7,500/s, no degradation) → **~3,400/slot at parallelism 2**. *Caveat: this is a **sustained
+fold-production rate**, not a pure 600 k-seed drain — output reached 2.6M because Flink's full-spine route/
+disposition writeback loops back onto `member.facts` and re-snapshots. Each is still a real fold op (read fact →
+event-time LWW → emit), so the ~6,780/s is a genuine sustained snapshot-fold throughput; it is not a "drain N in
+T" figure.* Takeaway: the in-stream fold is **not** the system bound and sits at the top of the low-thousands-
+per-slot band, scaling with parallelism — the earlier "~2k/s per partition" was conservative.
 
 **Net for the published POC:** the read latency claim in §2 ("Redis ~10× faster") does **not** hold
 app-representatively — it's a wash. The real read-model story per flavor is: **classic = Redis (native),
-KStreams = IQ/RocksDB (no Redis, HA-tuned, latency-neutral), Flink = Redis write-through (QS deprecated).**
+KStreams = IQ/RocksDB (no Redis, HA-tuned, latency-neutral), Flink = Redis write-through (QS deprecated)** — and
+all three are **proven to emit identical decisions** (§8a), so the flavor choice is purely operational.
 
 ## Verdict (evidence-based; read-surface bullets updated per §8)
 - **~~At this scale: keep Redis. Faster reads (10×)…~~** — *superseded by §8.* App-representative reads are a
