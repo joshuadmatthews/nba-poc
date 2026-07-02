@@ -1,0 +1,6 @@
+# Scripts and configs must stay LF so they run on macOS/Linux — CRLF breaks bash (`bad interpreter`) and can
+# confuse compose/python. (The repo root sets this globally; this covers the nba/ subtree in the public mirror.)
+*.sh   text eol=lf
+*.py   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf

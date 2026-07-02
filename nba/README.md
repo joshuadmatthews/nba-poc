@@ -13,6 +13,14 @@ Flink) — see [Findings](#findings) and [`infra/loadtest-results.md`](infra/loa
 
 ## Quickstart (one command)
 
+**Docker (macOS / Linux / Windows — no PowerShell) — the easy cross-platform path:**
+```bash
+cd nba && docker compose up --build      # builds + boots + seeds 200 members + turns the loop
+cd nba && docker compose down            # stop  (add -v to wipe data)
+```
+Works under `podman compose` too. Full guide + troubleshooting: [`README-docker.md`](README-docker.md).
+
+**PowerShell (Windows + podman):**
 ```powershell
 # First run — compiles every service image from source (~10–15 min), then boots + seeds + smoke-tests:
 pwsh nba/up.ps1 -Build

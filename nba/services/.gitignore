@@ -2,5 +2,6 @@
 */.gradle/
 */build/
 
-# staged by nba-model/run.ps1 from databricks/ml/rl_qnet.json (do not commit)
-nba-model/rl_qnet.json
+# nba-model/rl_qnet.json is COMMITTED (the legacy validation Q-net, == databricks/ml/rl_qnet.json) so the
+# Docker/compose build is self-contained (`docker compose up` needs no staging). run.ps1 -Build still stages the
+# same file from databricks/ml; point it at a different model to override, but don't commit that override.

@@ -1,0 +1,7 @@
+# Network-native seeder for the compose stack — talks to Redpanda + Redis directly (no exec), so it is
+# runtime-agnostic (Docker / podman / colima). One-shot: runs compose-seed.py then exits.
+FROM python:3.11-slim
+RUN pip install --no-cache-dir kafka-python==2.0.2 redis==5.0.8
+WORKDIR /seed
+COPY compose-seed.py definitions.jsonl redis-defs.sh /seed/
+CMD ["python", "compose-seed.py"]

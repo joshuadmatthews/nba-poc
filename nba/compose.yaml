@@ -1,0 +1,229 @@
+# NBA POC — the whole local flywheel as one Docker Compose stack (no Databricks, no cloud, no PowerShell).
+#
+#   docker compose up --build       # first run (builds images), then boots infra -> topics -> temporal ->
+#                                    # services -> seeds 200 demo members -> the loop turns
+#   docker compose down             # stop (keep data);  add -v to wipe the redpanda/postgres volumes
+#
+# Works unchanged under `podman compose up --build` too. Cross-platform (macOS/Linux/Windows), arm64 + amd64.
+# The convenience wrappers ./up.sh / ./down.sh add a readiness wait + a smoke check on top of plain compose.
+#
+# Service NAMES are the network aliases the code already expects (nba-redpanda, nba-redis, ...), so every
+# `NBA_BOOTSTRAP=nba-redpanda:9092` etc. resolves with zero config. Databricks/lakebase env is intentionally
+# OMITTED — this is the local-only stack; the local stand-ins (nba-model + journey-scorer + conversion-sim)
+# close the loop, exactly like `up.ps1`.
+name: nba
+
+x-svc: &svc
+  restart: unless-stopped
+
+services:
+  # ── infra (upstream images) ─────────────────────────────────────────────────────────────────
+  nba-redpanda:
+    <<: *svc
+    image: mirror.gcr.io/redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://nba-redpanda:9092
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster info >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  nba-postgres:
+    <<: *svc
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: nba
+      POSTGRES_PASSWORD: nba
+      POSTGRES_DB: actionlib
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nba -d actionlib"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  nba-redis:
+    <<: *svc
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  nba-temporal:
+    <<: *svc
+    image: temporalio/temporal:latest
+    command: ["server", "start-dev", "--ip", "0.0.0.0", "--log-level", "warn"]
+    ports:
+      - "8233:8233"          # Temporal Web UI -> http://localhost:8233
+    healthcheck:
+      test: ["CMD-SHELL", "temporal operator search-attribute list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+  # ── one-shot init: topics + temporal search attributes ──────────────────────────────────────
+  nba-topics:
+    image: mirror.gcr.io/redpandadata/redpanda:v24.2.7
+    restart: "no"
+    depends_on:
+      nba-redpanda: {condition: service_healthy}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        B=nba-redpanda:9092 ; P=${NBA_PARTITIONS:-1}
+        for t in nba.member.facts nba.snapshots nba.evaluations nba.activations nba.definitions; do
+          rpk topic create "$$t" -X brokers=$$B -p "$$P" -r 1 -c cleanup.policy=compact || true
+        done
+        for d in snapshot-builder action-router action-layer temporal-disposition temporal-bridge; do
+          rpk topic create "nba.dlq.$$d" -X brokers=$$B -p "$$P" -r 1 -c cleanup.policy=delete -c retention.ms=604800000 || true
+        done
+        rpk topic list -X brokers=$$B
+
+  nba-temporal-setup:
+    image: temporalio/temporal:latest
+    restart: "no"
+    depends_on:
+      nba-temporal: {condition: service_healthy}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        A=nba-temporal:7233
+        until temporal operator search-attribute list --address $$A >/dev/null 2>&1; do sleep 2; done
+        temporal operator search-attribute create --address $$A --name NbaActionId --type Keyword || true
+        temporal operator search-attribute create --address $$A --name NbaChannel  --type Keyword || true
+        echo "search attributes registered: NbaActionId, NbaChannel"
+
+  # ── app tier (built from each service's Containerfile) ──────────────────────────────────────
+  nba-model:
+    <<: *svc
+    build: {context: ./services/nba-model, dockerfile: Containerfile}
+    depends_on:
+      nba-redpanda: {condition: service_healthy}
+
+  nba-action-library:
+    <<: *svc
+    build: {context: ./services/action-library, dockerfile: Containerfile}
+    environment:
+      NBA_DB_URL: jdbc:postgresql://nba-postgres:5432/actionlib
+      NBA_BOOTSTRAP: nba-redpanda:9092
+      NBA_REDIS_HOST: nba-redis
+      NBA_MODEL_URL: http://nba-model:7011
+    ports:
+      - "7001:7001"          # authoring + inbound-serve/fast-path API
+    depends_on:
+      nba-postgres: {condition: service_healthy}
+      nba-redpanda: {condition: service_healthy}
+      nba-redis: {condition: service_healthy}
+      nba-topics: {condition: service_completed_successfully}
+
+  nba-snapshot-builder:
+    <<: *svc
+    build: {context: ./services/snapshot-builder, dockerfile: Containerfile}
+    environment:
+      NBA_BOOTSTRAP: nba-redpanda:9092
+      NBA_REDIS_HOST: nba-redis
+    depends_on:
+      nba-redpanda: {condition: service_healthy}
+      nba-redis: {condition: service_healthy}
+      nba-topics: {condition: service_completed_successfully}
+
+  nba-rules-engine:
+    <<: *svc
+    build: {context: ./services/rules-engine, dockerfile: Containerfile}
+    environment:
+      NBA_BOOTSTRAP: nba-redpanda:9092
+      NBA_REDIS_HOST: nba-redis
+      NBA_RULES_MODE: embedded          # embedded Drools — no kie-server needed for the local stack
+    depends_on:
+      nba-redpanda: {condition: service_healthy}
+      nba-redis: {condition: service_healthy}
+      nba-topics: {condition: service_completed_successfully}
+
+  nba-journey-scorer:
+    <<: *svc
+    build: {context: ./services/nba-journey-scorer, dockerfile: Containerfile}
+    environment:
+      NBA_BOOTSTRAP: nba-redpanda:9092
+    depends_on:
+      nba-redpanda: {condition: service_healthy}
+      nba-topics: {condition: service_completed_successfully}
+
+  nba-conversion-sim:
+    <<: *svc
+    build: {context: ./services/nba-conversion-sim, dockerfile: Containerfile}
+    environment:
+      NBA_BOOTSTRAP: nba-redpanda:9092
+      NBA_ACTION_LIBRARY: http://nba-action-library:7001
+    depends_on:
+      nba-redpanda: {condition: service_healthy}
+      nba-topics: {condition: service_completed_successfully}
+
+  nba-action-router:
+    <<: *svc
+    build: {context: ./services/action-router, dockerfile: Containerfile}
+    environment:
+      NBA_BOOTSTRAP: nba-redpanda:9092
+      NBA_REDIS_HOST: nba-redis
+    depends_on:
+      nba-redpanda: {condition: service_healthy}
+      nba-redis: {condition: service_healthy}
+      nba-topics: {condition: service_completed_successfully}
+
+  nba-temporal-worker:
+    <<: *svc
+    build: {context: ./services/nba-temporal, dockerfile: Containerfile}
+    environment:
+      NBA_BOOTSTRAP: nba-redpanda:9092
+      NBA_REDIS_HOST: nba-redis
+      NBA_TEMPORAL: nba-temporal:7233
+    depends_on:
+      nba-redpanda: {condition: service_healthy}
+      nba-redis: {condition: service_healthy}
+      nba-temporal: {condition: service_healthy}
+      nba-temporal-setup: {condition: service_completed_successfully}
+      nba-topics: {condition: service_completed_successfully}
+
+  nba-action-layer:
+    <<: *svc
+    build: {context: ./services/action-layer, dockerfile: Containerfile}
+    environment:
+      NBA_BOOTSTRAP: nba-redpanda:9092
+    depends_on:
+      nba-redpanda: {condition: service_healthy}
+      nba-topics: {condition: service_completed_successfully}
+
+  # ── one-shot seed: definitions + rulefacts + N demo members (network-native, no exec) ───────
+  nba-seed:
+    build: {context: ./infra/seed, dockerfile: Containerfile}
+    restart: "no"
+    environment:
+      NBA_BOOTSTRAP: nba-redpanda:9092
+      NBA_REDIS_HOST: nba-redis
+      NBA_SEED_MEMBERS: ${NBA_SEED_MEMBERS:-200}
+    depends_on:
+      nba-redpanda: {condition: service_healthy}
+      nba-redis: {condition: service_healthy}
+      nba-topics: {condition: service_completed_successfully}
+      nba-snapshot-builder: {condition: service_started}
+      nba-rules-engine: {condition: service_started}
+      nba-action-router: {condition: service_started}
+
+volumes:
+  redpanda-data:
+  postgres-data:
