@@ -239,4 +239,60 @@ class StateMachineFnTest {
             h.close();
         }
     }
+
+    // ── the SM owns raw->canonical classification (the sender reports RAW only) ─────────────────────────
+
+    @Test void dispositionClassifierTaxonomy() {
+        assertEquals("PRESENTED", DispositionClassifier.classify("Delivered"));
+        assertEquals("PRESENTED", DispositionClassifier.classify("Opened"));
+        assertEquals("PRESENTED", DispositionClassifier.classify("Accepted"));       // inbound funnel raw
+        assertEquals("FAILED", DispositionClassifier.classify("Bounced"));
+        assertEquals("FAILED", DispositionClassifier.classify("NoAnswer"));
+        assertEquals("DECLINED", DispositionClassifier.classify("STOP"));
+        assertEquals("DECLINED", DispositionClassifier.classify("Unsubscribe"));
+        assertEquals("SUPPRESSED", DispositionClassifier.classify("Cancelled"));
+        assertEquals("SUPPRESS_FAILED", DispositionClassifier.classify("AlreadySent"));
+        assertEquals("PRESENTED", DispositionClassifier.classify("SomeNewProviderStatus"));  // unknown = reached member
+        assertEquals("SUPPRESSED", DispositionClassifier.classify("SUPPRESSED"));            // already-canonical passthrough
+    }
+
+    @Test void smClassifiesRawDispositionValue() throws Exception {
+        var h = smHarness(1);
+        h.processElement(new StateEvent("nbaR:act1:email", "CREATE", createFact("nbaR", "mR", "act1", "email")), 1L);
+        h.setProcessingTime(60_000L);                                            // debounce -> gate -> DISPATCH/TRACKING
+        assertEquals(1, countState(h, "IN_PROCESS"));
+        h.processElement(new StateEvent("nbaR:act1:email", "DISPOSITION", "{\"value\":\"Bounced\"}"), 61_000L);
+        assertEquals(1, countState(h, "FAILED"), "raw 'Bounced' classified by the SM -> FAILED (terminal)");
+        h.close();
+    }
+
+    // ── INBOUND journey: a preDispatched CREATE (inbound serve) rides the same lifecycle ────────────────
+
+    static String inboundCreate(String nbaId, String entityId, String actionId, String channel, long ttlSec) {
+        return "{\"op\":\"CREATE\",\"preDispatched\":true,\"nbaId\":\"" + nbaId + "\",\"entityType\":\"OPERATOR\""
+                + ",\"entityId\":\"" + entityId + "\",\"actionId\":\"" + actionId + "\",\"channel\":\"" + channel
+                + "\",\"name\":\"n\",\"contentKey\":\"c\",\"ttlSeconds\":" + ttlSec + ",\"score\":5.0,\"source\":\"inbound\",\"eventTs\":1}";
+    }
+
+    @Test void preDispatchedInboundSkipsDispatchWalksAndExpires() throws Exception {
+        var h = smHarness(300);                       // long debounce would hold a normal CREATE — inbound must not wait on it
+        h.processElement(new StateEvent("nbaI:act1:web", "CREATE", inboundCreate("nbaI", "mI", "act1", "web", 60)), 1L);
+        assertEquals(0, countState(h, "CREATED"), "inbound skips the pre-send pipeline");
+        assertEquals(1, countState(h, "IN_PROCESS"), "inbound starts tracking immediately");
+        h.processElement(new StateEvent("nbaI:act1:web", "DISPOSITION", "{\"value\":\"Accepted\"}"), 2_000L);
+        assertEquals(1, countState(h, "PRESENTED"), "raw inbound 'Accepted' classified -> PRESENTED");
+        h.setProcessingTime(61_000L);                 // past ttlSeconds=60 -> the SAME expiration outbounds get
+        assertEquals(1, countState(h, "EXPIRED"), "inbound expires on the standard TTL");
+        h.close();
+    }
+
+    @Test void preDispatchedInboundHardCompletesLikeOutbound() throws Exception {
+        var h = smHarness(300);
+        h.processElement(new StateEvent("nbaH:act1:web", "CREATE", inboundCreate("nbaH", "mH", "act1", "web", 600)), 1L);
+        h.processElement(new StateEvent("nbaH:act1:web", "HARD_COMPLETE", "{}"), 2_000L);
+        assertEquals(1, countState(h, "HARD_COMPLETED"), "inbound reaches the goal terminal");
+        h.setProcessingTime(700_000L);
+        assertEquals(0, countState(h, "EXPIRED"), "a hard-completed inbound never expires");
+        h.close();
+    }
 }

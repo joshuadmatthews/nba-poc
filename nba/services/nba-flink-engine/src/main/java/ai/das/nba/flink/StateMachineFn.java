@@ -153,6 +153,18 @@ public class StateMachineFn extends KeyedBroadcastProcessFunction<String, StateE
                 st.channel = v.path("channel").asText(""); st.name = v.path("name").asText("");
                 st.contentKey = v.path("contentKey").asText(""); st.ttlSeconds = v.path("ttlSeconds").asLong(0);
                 st.correlationId = v.path("correlationId").asText(""); st.score = v.path("score").asDouble(0);
+                // PRE-DISPATCHED create (an INBOUND serve — the action-library already presented the action to
+                // the member, so there is nothing to debounce/throttle/dispatch): go straight to TRACKING at
+                // IN_PROCESS and watch dispositions to soft/hard completion or TTL -> EXPIRED. Mirrors the
+                // Temporal ChannelActionWorkflowImpl preDispatched path — the inbound rides the SAME journey.
+                if (v.path("preDispatched").asBoolean(false)) {
+                    emit(st, "IN_PROCESS", out, ctx);
+                    st.phase = "TRACKING";
+                    st.ttlAt = now + Math.max(1L, st.ttlSeconds) * 1000L;
+                    ctx.timerService().registerProcessingTimeTimer(st.ttlAt);
+                    state.update(st);
+                    return;
+                }
                 st.phase = "DEBOUNCE";
                 emit(st, "CREATED", out, ctx);
                 st.debounceAt = now + debounceMs;
@@ -183,7 +195,10 @@ public class StateMachineFn extends KeyedBroadcastProcessFunction<String, StateE
             }
             case "DISPOSITION" -> {
                 if (st == null || !"TRACKING".equals(st.phase)) return;
-                String d = v.has("state") ? v.path("state").asText("") : v.path("value").asText("");
+                // RAW provider status rides `value`; the state machine classifies it (the action-layer no longer
+                // decides state). Fall back to a legacy `state` field for facts produced before this change.
+                String raw = v.has("value") ? v.path("value").asText("") : v.path("state").asText("");
+                String d = DispositionClassifier.classify(raw);
                 if (d.isEmpty()) return;
                 if ("SUPPRESS_FAILED".equals(d)) { st.cancelSent = false; state.update(st); return; }
                 emit(st, d, out, ctx);

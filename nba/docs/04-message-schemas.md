@@ -213,14 +213,21 @@ So the serve→disposition journey is linkable downstream — in the lake and th
 {
   "entityType": "OPERATOR", "entityId": "op-sg-0",
   "key": "nba.disposition.action_reengage.email",
-  "value": "Delivered",        // raw provider status — rules engine reads this
-  "state": "PRESENTED",        // canonical delivery state — state machine reads this
+  "value": "Delivered",        // RAW provider status — the ONLY thing the sender reports
   "valueType": "STRING", "eventTs": 1749000012000, "source": "action-layer",
   "correlationId": "550e8400-...", "memberId": "op-sg-0", "channel": "email",
   "contentKey": "tmpl.action_reengage.email.v1",
   "trackingId": "nba-ca:nba_a1b2c3d4e5f6:action_reengage:email|550e8400-..."
 }
 ```
+**The sender reports RAW only; the state machine owns the mapping.** The action-layer (a simulated provider /
+real webhook) is a dumb adapter — it puts the raw provider status in `value` and nothing else. It does **not**
+decide a canonical `state` (there is no `state` field). The **state machine** classifies raw → canonical itself
+(`DispositionClassifier`, kept identical in the Temporal worker and the Flink engine): `Delivered`/`Opened`/
+`LinkClicked`/… → `PRESENTED`; `Bounced`/`Undelivered`/`Failed`/`NoAnswer` → `FAILED`; `Unsubscribe`/`STOP`/
+`Dismissed`/`Declined` → `DECLINED`; the cancel responses `Cancelled` → `SUPPRESSED`, `AlreadySent` →
+`SUPPRESS_FAILED`. The rules engine independently reads the raw `value` for soft-completion. One source of truth
+for "what a raw status means for the lifecycle," owned by the lifecycle.
 
 ### State fact (`nba.member.facts`, header `kind=state`)
 
@@ -385,8 +392,7 @@ The wire format is JSON, but these Avro records are the canonical type contract.
     {"name": "entityType", "type": "string"},
     {"name": "entityId", "type": "string"},
     {"name": "key", "type": "string"},
-    {"name": "value", "type": "string", "doc": "raw provider status"},
-    {"name": "state", "type": "string", "doc": "canonical delivery state"},
+    {"name": "value", "type": "string", "doc": "raw provider status — the state machine classifies it to canonical"},
     {"name": "valueType", "type": "string"},
     {"name": "eventTs", "type": "long"},
     {"name": "source", "type": "string"},

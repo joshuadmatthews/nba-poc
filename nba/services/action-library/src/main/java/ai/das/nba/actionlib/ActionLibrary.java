@@ -549,6 +549,7 @@ public class ActionLibrary {
                 ObjectNode o = M.createObjectNode();
                 o.put("actionId", aid); o.put("channel", ch); o.put("name", e.path("name").asText());
                 o.put("contentKey", e.path("contentKey").asText());
+                o.put("ttlSeconds", e.path("ttlSeconds").asLong(600));   // rides to the inbound journey workflow (its TTL -> EXPIRED)
                 if (e.hasNonNull("score")) o.set("score", e.get("score")); else o.putNull("score");
                 o.put("state", done ? "completed" : (e.path("active").asBoolean(false) ? "active" : "eligible"));
                 out.add(o); seen.add(aid + "::" + ch);
@@ -592,7 +593,52 @@ public class ActionLibrary {
         c.json(resp);
         if (!actions.isEmpty()) { JsonNode top = actions.get(0);
             emitInbound("INBOUND_SERVE", entity, nbaId, top.path("channel").asText(chanAll ? "" : channel),
-                        top.path("actionId").asText(), correlationId, null, top.get("score")); }
+                        top.path("actionId").asText(), correlationId, null, top.get("score"));
+            // INBOUND JOURNEY: the served top action rides the SAME lifecycle as an outbound. Emit a
+            // PRE-DISPATCHED router CREATE (kind=router) — the state-machine bridge starts the standard
+            // ChannelActionWorkflow for (member, action, channel), which skips debounce/throttle/dispatch
+            // (the member was already presented the action right here) and goes straight to IN_PROCESS,
+            // tracking dispositions to soft/hard completion or TTL -> EXPIRED. Idempotent: a live workflow
+            // on the same key (an in-flight outbound, or a re-serve) dedups via the deterministic
+            // workflowId, so we only emit for a freshly-ELIGIBLE serve. AFTER c.json(...): off the hot path.
+            if ("eligible".equals(top.path("state").asText()) && nbaId != null && !nbaId.isEmpty())
+                startInboundJourney(redis, entity, nbaId, top, correlationId); }
+    }
+
+    /** Start the standard journey for an inbound-served action: a preDispatched router CREATE (direct Kafka,
+     *  fire-and-forget like the INBOUND_SERVE tracking event — the deterministic workflowId dedups retries) plus
+     *  the OPTIMISTIC HOT-PATCH: the state machine is async (fact -> bridge -> workflow -> state fact -> snapshot,
+     *  seconds), so write nba.actionstate.{action}.{channel} = IN_PROCESS straight into the Redis snapshot NOW —
+     *  the UI's next read shows the action in-process immediately; the workflow's own (later-eventTs) state facts
+     *  reconcile via event-time LWW. Mirrors the existing hot-path write-through; best-effort, never fails the serve. */
+    static void startInboundJourney(JedisPooled redis, String entity, String nbaId, JsonNode top, String correlationId) {
+        if (PRODUCER == null) return;
+        String aid = top.path("actionId").asText(""), ch = top.path("channel").asText("");
+        if (aid.isEmpty() || ch.isEmpty()) return;
+        try {
+            long now = System.currentTimeMillis();
+            String wfId = "nba-ca:" + nbaId + ":" + aid + ":" + ch;
+            ObjectNode a = M.createObjectNode();
+            a.put("op", "CREATE"); a.put("preDispatched", true);
+            a.put("nbaId", nbaId); a.put("entityType", "OPERATOR"); a.put("entityId", entity); a.put("memberId", entity);
+            a.put("actionId", aid); a.put("channel", ch); a.put("name", top.path("name").asText(""));
+            a.put("contentKey", top.path("contentKey").asText(""));
+            a.put("ttlSeconds", top.path("ttlSeconds").asLong(600));
+            if (top.hasNonNull("score")) a.set("score", top.get("score"));
+            a.put("correlationId", correlationId);
+            a.put("trackingId", wfId + "|" + correlationId);     // dispositions route back to this workflow
+            a.put("source", "inbound"); a.put("eventTs", now);
+            ProducerRecord<String, String> rec = new ProducerRecord<>(MEMBER_FACTS, "OPERATOR:" + entity, M.writeValueAsString(a));
+            rec.headers().add("kind", "router".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            PRODUCER.send(rec);
+            // optimistic hot-patch (skip when the snapshot store isn't Redis-authored, same as the fast path)
+            if (!"kstreams".equalsIgnoreCase(SNAPSHOT_SOURCE)) {
+                ObjectNode fv = M.createObjectNode();
+                fv.put("value", "IN_PROCESS"); fv.put("valueType", "STRING"); fv.put("eventTs", now); fv.put("source", "inbound-serve");
+                redis.hset("nba:snapshot:" + nbaId, "fact:nba.actionstate." + aid + "." + ch, M.writeValueAsString(fv));
+            }
+            log.info("inbound journey start " + wfId + " (preDispatched, corr=" + correlationId + ")");
+        } catch (Exception e) { log.warn("inbound journey start failed (serve unaffected)", e); }
     }
 
     static final java.util.Map<String, List<String>> CHANNEL_FUNNEL = java.util.Map.ofEntries(
@@ -617,19 +663,35 @@ public class ActionLibrary {
         if (entity.isEmpty() || actionId.isEmpty() || channel.isEmpty()) { c.status(400).result("entityId, actionId, channel required"); return; }
         String nbaId = entity.startsWith("nba_") ? entity : redis.get("nba:idmap:OPERATOR:" + entity);
         String contentKey = b.path("contentKey").asText("");
+        String correlationId = b.path("correlationId").asText("");   // echo of the serve's correlationId
+        long now = System.currentTimeMillis();
         String key = "nba.disposition." + actionId + "." + channel;
         ObjectNode fact = M.createObjectNode();
         fact.put("entityType", "OPERATOR"); fact.put("entityId", entity);
         if (nbaId != null) fact.put("nbaId", nbaId);
         fact.put("key", key); fact.put("value", status); fact.put("valueType", "STRING");
         if (!contentKey.isEmpty()) fact.put("contentKey", contentKey);
-        fact.put("eventTs", System.currentTimeMillis()); fact.put("source", "inbound");
+        if (!correlationId.isEmpty()) fact.put("correlationId", correlationId);
+        // trackingId routes this disposition to the member's journey workflow for (action, channel) — the SAME
+        // workflow an inbound serve pre-dispatched (or an outbound dispatched). The state machine classifies the
+        // raw status itself (DispositionClassifier); this endpoint just reports what the member did.
+        if (nbaId != null) fact.put("trackingId", "nba-ca:" + nbaId + ":" + actionId + ":" + channel + "|" + correlationId);
+        fact.put("eventTs", now); fact.put("source", "inbound");
         // keyed by memberId (OPERATOR:{entity}) so it co-locates with the member's facts on one partition.
         try (Connection conn = ds.getConnection()) {
             conn.setAutoCommit(false);
             outbox(conn, MEMBER_FACTS, "OPERATOR:" + entity, "disposition", M.writeValueAsString(fact));
             conn.commit();
         }
+        // optimistic hot-patch: the disposition is visible on the snapshot NOW (the outbox->bus->fold leg
+        // reconciles via event-time LWW). Best-effort; the durable write above already committed.
+        try {
+            if (nbaId != null && !"kstreams".equalsIgnoreCase(SNAPSHOT_SOURCE)) {
+                ObjectNode fv = M.createObjectNode();
+                fv.put("value", status); fv.put("valueType", "STRING"); fv.put("eventTs", now); fv.put("source", "inbound");
+                redis.hset("nba:snapshot:" + nbaId, "fact:" + key, M.writeValueAsString(fv));
+            }
+        } catch (Exception e) { log.warn("disposition hot-patch failed (outbox already committed)", e); }
         log.info("inbound disposition " + entity + " " + actionId + "/" + channel + " = " + status + " (outbox)");
         c.json(fact);
     }

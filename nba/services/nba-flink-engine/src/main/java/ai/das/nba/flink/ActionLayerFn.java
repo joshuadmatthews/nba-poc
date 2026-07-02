@@ -41,12 +41,12 @@ public class ActionLayerFn extends KeyedProcessFunction<String, FactRecord, Kafk
             ctx.timerService().registerProcessingTimeTimer(t);
         } else if ("CANCEL".equals(op)) {
             String p = pending.value();
-            if (p != null) {                                  // caught before delivery -> SUPPRESSED
-                out.collect(disposition(p, "SUPPRESSED", "Cancelled"));
+            if (p != null) {                                  // caught before delivery -> raw "Cancelled" (SM classifies -> SUPPRESSED)
+                out.collect(disposition(p, "Cancelled"));
                 Long ta = timerAt.value(); if (ta != null) ctx.timerService().deleteProcessingTimeTimer(ta);
                 pending.clear(); timerAt.clear();
-            } else {                                          // already delivered -> the send proceeds
-                out.collect(disposition(act.value, "SUPPRESS_FAILED", "AlreadySent"));
+            } else {                                          // already delivered -> raw "AlreadySent" (SM -> SUPPRESS_FAILED)
+                out.collect(disposition(act.value, "AlreadySent"));
             }
         }
     }
@@ -54,19 +54,21 @@ public class ActionLayerFn extends KeyedProcessFunction<String, FactRecord, Kafk
     @Override
     public void onTimer(long ts, OnTimerContext ctx, Collector<KafkaOut> out) throws Exception {
         String p = pending.value();
-        if (p != null) {                                      // deliver
-            out.collect(disposition(p, "PRESENTED", "Delivered"));
+        if (p != null) {                                      // deliver -> raw "Delivered" (SM classifies -> PRESENTED)
+            out.collect(disposition(p, "Delivered"));
             pending.clear(); timerAt.clear();
         }
     }
 
-    /** Build a disposition fact from the activation it answers — keyed by the member, kind=disposition. */
-    private static KafkaOut disposition(String activationJson, String state, String raw) {
+    /** Build a disposition fact from the activation it answers — keyed by the member, kind=disposition.
+     *  Emits the RAW provider status only (`value`); the state machine (StateMachineFn) classifies raw -> canonical
+     *  via DispositionClassifier — the action-layer no longer decides the lifecycle state. */
+    private static KafkaOut disposition(String activationJson, String raw) {
         try {
             JsonNode a = SnapshotLogic.M.readTree(activationJson);
             String et = a.path("entityType").asText("OPERATOR"), eid = a.path("entityId").asText("");
             ObjectNode o = SnapshotLogic.M.createObjectNode();
-            o.put("state", state); o.put("raw", raw);
+            o.put("value", raw);                              // RAW status only; the SM classifies it
             o.put("trackingId", a.path("trackingId").asText(""));
             o.put("entityType", et); o.put("entityId", eid);
             o.put("channel", a.path("channel").asText("")); o.put("source", "action-layer");

@@ -1,12 +1,16 @@
 package ai.das.nba.flink;
 
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.api.common.restartstrategy.RestartStrategies;
+import org.apache.flink.api.common.time.Time;
 import org.apache.flink.connector.base.DeliveryGuarantee;
 import org.apache.flink.connector.kafka.sink.KafkaSink;
 import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
+import org.apache.flink.contrib.streaming.state.EmbeddedRocksDBStateBackend;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
+import org.apache.flink.streaming.api.environment.CheckpointConfig;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -36,6 +40,22 @@ public class NbaFlinkApp {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(cfg.parallelism);
         env.enableCheckpointing(cfg.checkpointMs);   // exactly-once state + (with the EOS sink) end-to-end EOS
+
+        // ── durability hardening (prod crash-recovery) ──────────────────────────────────────────────
+        // Default (getExecutionEnvironment + enableCheckpointing alone) keeps state in HEAP and checkpoints in
+        // JobManager MEMORY — ephemeral, so a process/JobManager loss restarts COLD ("No checkpoint found").
+        // Fix: (1) RocksDB state backend — keyed state spills to disk (no heap RAM wall), incremental checkpoints;
+        // (2) externalized checkpoints to a DURABLE dir so a restart resumes from the last checkpoint;
+        // (3) RETAIN_ON_CANCELLATION so the checkpoint survives for manual/HA recovery;
+        // (4) a bounded fixed-delay restart strategy (recover from transient task failures without hot-looping).
+        // NB: automatic JobManager FAILOVER additionally needs cluster HA (high-availability: kubernetes|zookeeper
+        // + high-availability.storageDir) — configured at deploy time on the Flink K8s Operator, not in-JVM here.
+        if (cfg.rocksDbState) env.setStateBackend(new EmbeddedRocksDBStateBackend(true));   // true = incremental
+        env.getCheckpointConfig().setCheckpointStorage(cfg.checkpointDir);
+        env.getCheckpointConfig().setExternalizedCheckpointCleanup(
+                CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION);
+        env.setRestartStrategy(RestartStrategies.fixedDelayRestart(
+                cfg.restartAttempts, Time.seconds(cfg.restartDelaySeconds)));
 
         log.info("NBA Flink engine starting mode={} score={} bootstrap={} parallelism={}",
                 cfg.authoritative ? "AUTHORITATIVE" : "shadow", cfg.scoreEnabled ? "on" : "off (Databricks RL)",

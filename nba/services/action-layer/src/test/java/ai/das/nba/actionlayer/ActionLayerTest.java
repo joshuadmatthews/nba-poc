@@ -95,7 +95,7 @@ class ActionLayerTest {
         JsonNode fact = parse(rec.value());
         assertEquals("nba.disposition.act-A.email", fact.get("key").asText());
         assertEquals("Opened", fact.get("value").asText(), "VALUE = the raw provider status (rules engine reads this)");
-        assertEquals("PRESENTED", fact.get("state").asText(), "STATE = the canonical delivery state (the state machine walks this)");
+        assertNull(fact.get("state"), "NO state field — the sender reports RAW only; the STATE MACHINE classifies (DispositionClassifier)");
         assertEquals("STRING", fact.get("valueType").asText());
         assertEquals("action-layer", fact.get("source").asText());
 
@@ -113,7 +113,7 @@ class ActionLayerTest {
     }
 
     @Test
-    void emitDispositionCarriesStateAndRawForEachDeliveryStep() {
+    void emitDispositionCarriesRawOnlyForEachDeliveryStep() {
         // (canonicalState, rawProviderStatus) pairs across the email funnel + a failure/decline. (No SENT: the
         // workflow emits IN_PROCESS on dispatch; delivery dispositions all map to PRESENTED with the raw riding
         // along, so the rules engine can decide soft-completion off the raw — soft is NOT an activation state.)
@@ -124,7 +124,7 @@ class ActionLayerTest {
             ActionLayer.emitDisposition(p, MEMBER_FACTS, singleActivation(), "act-A", "welcome.v1", "trk-A", s[0], s[1]);
             JsonNode fact = parse(p.history().get(0).value());
             assertEquals(s[1], fact.get("value").asText(), "raw " + s[1] + " in value");
-            assertEquals(s[0], fact.get("state").asText(), "canonical " + s[0] + " in state");
+            assertNull(fact.get("state"), "no state field — the SM classifies " + s[1] + " -> " + s[0] + " itself");
         }
     }
 
@@ -140,7 +140,7 @@ class ActionLayerTest {
         JsonNode fact = parse(rec.value());
         assertEquals("nba.disposition.act-Z.", fact.get("key").asText(), "missing channel -> trailing dot");
         assertEquals("Bounced", fact.get("value").asText());
-        assertEquals("FAILED", fact.get("state").asText());
+        assertNull(fact.get("state"), "no state field (SM classifies Bounced -> FAILED)");
     }
 
     // ------------------------------------------------------------------------------------------------
@@ -176,7 +176,7 @@ class ActionLayerTest {
         // state applied uniformly across the fan-out (raw=Delivered -> canonical PRESENTED)
         for (ProducerRecord<String, String> rec : p.history()) {
             assertEquals("Delivered", parse(rec.value()).get("value").asText());
-            assertEquals("PRESENTED", parse(rec.value()).get("state").asText());
+            assertNull(parse(rec.value()).get("state"), "no state field (SM classifies)");
         }
     }
 
@@ -190,7 +190,7 @@ class ActionLayerTest {
         JsonNode fact = parse(p.history().get(0).value());
         assertEquals("nba.disposition.act-A.email", fact.get("key").asText());
         assertEquals("Cancelled", fact.get("value").asText());
-        assertEquals("SUPPRESSED", fact.get("state").asText());
+        assertNull(fact.get("state"), "no state field (SM classifies Cancelled -> SUPPRESSED)");
         assertEquals("trk-A", fact.get("trackingId").asText());
     }
 
@@ -214,7 +214,7 @@ class ActionLayerTest {
     }
 
     @Test
-    void dispositionBatchFanOutCarriesStateAndRawPerAction() {
+    void dispositionBatchFanOutCarriesRawPerAction() {
         MockProducer<String, String> p = newProducer();
         ActionLayer.disposition(p, MEMBER_FACTS, batchActivation(), "SUPPRESSED", "Cancelled");
         for (int i = 0; i < 3; i++)
@@ -222,7 +222,7 @@ class ActionLayerTest {
                     parse(p.history().get(i).value()).get("key").asText());
         for (ProducerRecord<String, String> rec : p.history()) {
             assertEquals("Cancelled", parse(rec.value()).get("value").asText());
-            assertEquals("SUPPRESSED", parse(rec.value()).get("state").asText());
+            assertNull(parse(rec.value()).get("state"), "no state field (SM classifies)");
         }
     }
 
@@ -315,7 +315,7 @@ class ActionLayerTest {
             ActionLayer.emitDisposition(p, MEMBER_FACTS, a, "act", "c", "t", "DECLINED", s[1]);
             JsonNode fact = parse(p.history().get(0).value());
             assertEquals(s[1], fact.get("value").asText(), s[0] + " opt-out raw");
-            assertEquals("DECLINED", fact.get("state").asText());
+            assertNull(fact.get("state"), "no state field (SM classifies the opt-out raw -> DECLINED)");
         }
     }
 }

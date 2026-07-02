@@ -43,12 +43,14 @@ services:
   nba-postgres:
     <<: *svc
     image: postgres:16-alpine
+    command: ["postgres", "-c", "wal_level=logical"]   # logical replication for the Debezium outbox CDC
     environment:
       POSTGRES_USER: nba
       POSTGRES_PASSWORD: nba
       POSTGRES_DB: actionlib
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      - ./infra/outbox-tables.sql:/docker-entrypoint-initdb.d/10-outbox-tables.sql:ro   # outbox DDL on first init
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U nba -d actionlib"]
       interval: 5s
@@ -108,6 +110,78 @@ services:
         temporal operator search-attribute create --address $$A --name NbaActionId --type Keyword || true
         temporal operator search-attribute create --address $$A --name NbaChannel  --type Keyword || true
         echo "search attributes registered: NbaActionId, NbaChannel"
+
+  # ── reliable publish: Debezium CDC-tails the Postgres outbox tables -> Kafka ────────────────
+  # The Temporal worker's state/activation emits AND the action-library's definition upserts +
+  # inbound dispositions all go through the transactional outbox (outbox-tables.sql, loaded into
+  # Postgres at init). Without this tier the state machine writes rows that never reach the bus.
+  nba-connect:
+    <<: *svc
+    image: quay.io/debezium/connect:2.7
+    environment:
+      BOOTSTRAP_SERVERS: nba-redpanda:9092
+      GROUP_ID: nba-connect
+      CONFIG_STORAGE_TOPIC: nba_connect_configs
+      OFFSET_STORAGE_TOPIC: nba_connect_offsets
+      STATUS_STORAGE_TOPIC: nba_connect_status
+      CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      STATUS_STORAGE_REPLICATION_FACTOR: "1"
+      OFFSET_STORAGE_PARTITIONS: "1"
+      STATUS_STORAGE_PARTITIONS: "1"
+      KEY_CONVERTER: org.apache.kafka.connect.storage.StringConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.storage.StringConverter
+      CONNECT_EXACTLY_ONCE_SOURCE_SUPPORT: enabled
+    depends_on:
+      nba-redpanda: {condition: service_healthy}
+      nba-postgres: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/connectors >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  nba-connect-setup:
+    image: quay.io/debezium/connect:2.7
+    restart: "no"
+    depends_on:
+      nba-connect: {condition: service_healthy}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        cat > /tmp/nba-outbox.json <<'JSON'
+        {
+          "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+          "database.hostname": "nba-postgres",
+          "database.port": "5432",
+          "database.user": "nba",
+          "database.password": "nba",
+          "database.dbname": "actionlib",
+          "topic.prefix": "nbaoutbox",
+          "plugin.name": "pgoutput",
+          "slot.name": "nba_outbox",
+          "publication.name": "nba_outbox_pub",
+          "publication.autocreate.mode": "filtered",
+          "table.include.list": "public.outbox_member_facts,public.outbox_activations,public.outbox_defs",
+          "tombstones.on.delete": "false",
+          "exactly.once.support": "required",
+          "transforms": "outbox",
+          "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
+          "transforms.outbox.route.by.field": "aggregatetype",
+          "transforms.outbox.route.topic.replacement": "$${routedByValue}",
+          "transforms.outbox.table.field.event.key": "aggregateid",
+          "transforms.outbox.table.field.event.payload": "payload",
+          "transforms.outbox.table.fields.additional.placement": "kind:header",
+          "transforms.outbox.route.tombstone.on.empty.payload": "true",
+          "key.converter": "org.apache.kafka.connect.storage.StringConverter",
+          "value.converter": "org.apache.kafka.connect.storage.StringConverter"
+        }
+        JSON
+        until curl -sf -X PUT -H 'Content-Type: application/json' \
+          --data @/tmp/nba-outbox.json http://nba-connect:8083/connectors/nba-outbox/config >/dev/null; do
+          echo "waiting for connect REST..."; sleep 3
+        done
+        echo "connector nba-outbox registered"
 
   # ── app tier (built from each service's Containerfile) ──────────────────────────────────────
   nba-model:
@@ -192,9 +266,11 @@ services:
       NBA_BOOTSTRAP: nba-redpanda:9092
       NBA_REDIS_HOST: nba-redis
       NBA_TEMPORAL: nba-temporal:7233
+      NBA_PG_HOST: nba-postgres      # the worker's dynamic-state DB (channel_touch/nba_inflight); its code default is the podman name
     depends_on:
       nba-redpanda: {condition: service_healthy}
       nba-redis: {condition: service_healthy}
+      nba-postgres: {condition: service_healthy}
       nba-temporal: {condition: service_healthy}
       nba-temporal-setup: {condition: service_completed_successfully}
       nba-topics: {condition: service_completed_successfully}

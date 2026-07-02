@@ -548,9 +548,10 @@ public class ActionLayer {
         fact.put("entityType", entityType);
         fact.put("entityId", memberId);          // member fact addressed by memberId (no nbaId)
         fact.put("key", key);
-        fact.put("value", raw);                  // VALUE = the raw provider status — the rules engine evaluates
-                                                 // soft-completion against the channel bar off this (Phase-1 funnel).
-        fact.put("state", state);                // canonical DELIVERY state — the state machine walks this.
+        fact.put("value", raw);                  // VALUE = the RAW provider status — the ONLY thing the sender
+                                                 // reports. The rules engine evaluates soft-completion off it,
+                                                 // and the STATE MACHINE classifies raw -> canonical itself
+                                                 // (DispositionClassifier); the sender no longer decides state.
         fact.put("valueType", "STRING");
         fact.put("eventTs", System.currentTimeMillis());
         fact.put("source", "action-layer");

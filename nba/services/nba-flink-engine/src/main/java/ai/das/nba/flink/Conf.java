@@ -24,6 +24,11 @@ public class Conf implements Serializable {
     public long dispositionStepMs;
     public double hardFraction;
     public boolean entryEarliest;
+    // durability hardening (prod crash-recovery)
+    public String checkpointDir;
+    public boolean rocksDbState;
+    public int restartAttempts;
+    public long restartDelaySeconds;
 
     public String memberFacts, snapshots, evaluations, definitions, facts, dlq, activations;
 
@@ -38,6 +43,14 @@ public class Conf implements Serializable {
         c.scoreEnabled = !"off".equalsIgnoreCase(env("NBA_FLINK_SCORE", "on"));
         c.parallelism = Integer.parseInt(env("NBA_FLINK_PARALLELISM", "1"));
         c.checkpointMs = Long.parseLong(env("NBA_FLINK_CHECKPOINT_MS", "10000"));
+        // Durability hardening. Externalized checkpoints to a DURABLE dir (local file:// for the POC; override to
+        // s3://… / abfs:// in prod) + RocksDB (disk-backed, incremental) state backend, so a restart resumes from
+        // the last checkpoint instead of cold. NB: automatic JobManager failover ALSO needs cluster HA
+        // (high-availability: kubernetes|zookeeper + storageDir) — a deploy-time (Flink K8s Operator) concern.
+        c.checkpointDir = env("NBA_FLINK_CHECKPOINT_DIR", "file:///tmp/nba-flink-checkpoints");
+        c.rocksDbState = !"false".equalsIgnoreCase(env("NBA_FLINK_ROCKSDB", "true"));
+        c.restartAttempts = Integer.parseInt(env("NBA_FLINK_RESTART_ATTEMPTS", "10"));
+        c.restartDelaySeconds = Long.parseLong(env("NBA_FLINK_RESTART_DELAY_SEC", "10"));
         c.redisHost = env("NBA_REDIS_HOST", "nba-redis");
         c.redisPort = Integer.parseInt(env("NBA_REDIS_PORT", "6379"));
         c.redisWriteThrough = c.authoritative && !"false".equalsIgnoreCase(env("NBA_FLINK_REDIS_WRITE", "true"));

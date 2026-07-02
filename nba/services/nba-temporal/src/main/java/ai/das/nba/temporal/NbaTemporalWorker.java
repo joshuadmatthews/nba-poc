@@ -159,7 +159,11 @@ public class NbaTemporalWorker {
                         log.info("hardComplete " + nbaId + ":" + actionId + " -> " + ACTION_CHANNELS.getOrDefault(actionId, java.util.Set.of()));
                         continue;
                     }
-                    String status = d.path("state").asText(d.path("value").asText(""));   // canonical DELIVERY state
+                    // The fact carries the RAW provider status in `value`; the state machine (here) classifies it
+                    // to the canonical lifecycle state — the action-layer no longer decides state. (fall back to a
+                    // `state` field only for in-flight facts produced before this change.)
+                    String raw = d.path("value").asText(d.path("state").asText(""));
+                    String status = DispositionClassifier.classify(raw);
                     // trackingId = workflowId + "|" + correlationId. Deconstruct it to route the
                     // disposition straight to the workflow — no nbaId/key derivation, no lookup.
                     String trackingId = d.path("trackingId").asText("");
