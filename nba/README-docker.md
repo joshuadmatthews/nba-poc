@@ -72,6 +72,7 @@ Resources. podman: `podman machine stop && podman machine set --memory 12288 && 
 ## Notes
 - **Local-only by design.** The Databricks / lakebase env is intentionally not set — the local `nba-model`,
   `nba-journey-scorer`, and `nba-conversion-sim` close the loop instead (same as `up.ps1`).
+- **The reliable-publish tier is included**: Debezium Connect (`nba-connect`) CDC-tails the Postgres outbox tables to Kafka — the Temporal worker's state emits and the inbound dispositions depend on it (without it the state machine writes rows that never reach the bus).
 - **The seeder is network-native** (`infra/seed/compose-seed.py`): it talks to Redpanda and Redis directly, so
   it needs no `docker exec` and is runtime-agnostic. It reads the same canonical `definitions.jsonl` /
   `redis-defs.sh` the PowerShell path uses — no drift.

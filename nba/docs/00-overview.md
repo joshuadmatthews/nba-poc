@@ -40,7 +40,7 @@ Alongside this async outbound loop runs a **synchronous inbound hot path**: when
 | A send has a lifecycle (sent → delivered → engaged → converted) that must survive restarts | A **Temporal workflow** per ChannelAction holds the durable state machine. |
 | A burst of facts must not fire two competing sends | The state machine **debounces** and resolves the sibling race itself. |
 | Channels have daily/rate caps | A **throttle gate** in the state machine admits, queues, or reroutes. |
-| Exactly one communication per action | The **activation layer** is the single send point; it classifies provider statuses into canonical dispositions. |
+| Exactly one communication per action | The **activation layer** is the single send point; it reports the RAW provider status — the **state machine** classifies it to the canonical lifecycle state (`DispositionClassifier`). |
 | Everything must be auditable & analyzable | The lake captures every fact, evaluation, activation, and snapshot into a medallion. |
 | Humans need to see and steer it | The **Command Center** renders the live system and authors actions/rules. |
 
@@ -86,7 +86,7 @@ The decision spine has **three** interchangeable implementations: the **classic*
 | **Evaluation** | The rules-engine output: `channelActions[]` + `milestones[]`, keyed by `nbaId`. |
 | **ChannelAction** | One (action, channel) for one member — the decisioning atom. |
 | **Activation / decision** | A router op (`CREATE`/`SUPPRESS`/…) or a state-machine op (`DISPATCH`/`CANCEL`). |
-| **Disposition** | A channel outcome (raw provider status + canonical delivery state). |
+| **Disposition** | A channel outcome — the RAW provider status (`value`). The state machine classifies it to the canonical delivery state; the sender never decides state. |
 | **Soft / hard completion** | Engagement vs goal conversion (see above). |
 | **Debounce** | The window the state machine waits before sending, during which siblings dedup. |
 | **Throttle gate** | The per-channel admission control (SEND / WAIT / SUPPRESS). |

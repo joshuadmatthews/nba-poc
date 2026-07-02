@@ -113,7 +113,7 @@ See [04-message-schemas.md](04-message-schemas.md) for the full catalog.
 
 6. **Lean by construction.** The snapshot only stores facts that some rule references (`nba:rulefacts`) plus the always-attach internal facts (`nba.score.*`, `nba.actionstate.*`, `nba.disposition.*`, `nba.completion.*`). The medallion only emits the action-mapped subset to `nba.member.facts`. The signal stays small.
 
-7. **One communication per action.** The activation layer is the single send point. The router guarantees one winner per channel; the state machine guarantees one in-flight workflow per ChannelAction; the activation layer sends one comm and classifies the provider's raw status into a canonical disposition.
+7. **One communication per action.** The activation layer is the single send point. The router guarantees one winner per channel; the state machine guarantees one in-flight workflow per ChannelAction; the activation layer sends one comm and reports the provider's RAW status; the state machine classifies it to the canonical lifecycle state (`DispositionClassifier`, identical in the Temporal worker and the Flink engine).
 
 8. **Replay-safe timestamps.** Services that re-derive facts stamp the *decision time* (e.g. the scorer stamps the eval's `evaluatedAt`, not wall-clock) so replays cannot overwrite newer state via LWW. (The side effect: you cannot measure those hops' processing latency from the fact timestamp.)
 

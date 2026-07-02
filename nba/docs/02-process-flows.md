@@ -102,7 +102,7 @@ sequenceDiagram
         OB->>AC: DISPATCH (Debezium CDC)
         AC->>AL: consume
         Note over AL: send ONE comm; walk channel funnel
-        AL->>MF: nba.disposition.* (kind=disposition)<br/>value=raw status, state=canonical
+        AL->>MF: nba.disposition.* (kind=disposition)<br/>value=RAW status (the SM classifies)
     else WAIT
         Note over WF: re-await; backlog can drain before midnight
     else SUPPRESS (throttle)
@@ -112,7 +112,7 @@ sequenceDiagram
 
 - The state machine waits a **debounce window** before sending. During it, a `suppress()` (router superseding a not-yet-sent action) makes it `DEBOUNCED`; a sibling with a higher score makes it `DEBOUNCED` via the dedup. (Full algorithm in [03-state-machine.md](03-state-machine.md).)
 - On `SEND`, the workflow writes `DISPATCH` and `IN_PROCESS` to the Postgres **outbox**; Debezium publishes `DISPATCH` to `nba.activations` and `IN_PROCESS` to `nba.member.facts`.
-- The activation layer sends **one** comm and emits dispositions. Each disposition carries `value` (raw provider status — what the rules engine reads for soft-completion) and `state` (canonical delivery state — what the state machine reads).
+- The activation layer sends **one** comm and emits dispositions carrying ONLY `value` (the raw provider status). The rules engine reads the raw for soft-completion; the **state machine classifies raw → canonical itself** (`DispositionClassifier` — the sender never decides state).
 
 ## Flow E — Tracking the outcome (disposition → state → recirculation)
 
@@ -170,7 +170,7 @@ sequenceDiagram
 
 ## Flow G — Inbound pull serve, dispose, complete (no state machine)
 
-For surfaces that *ask* "what should I show this member right now?" (a portal, an agent screen, an inbound caller), the Action Library serves from Redis directly — no send, no workflow. The serve → disposition → completion journey is stitched together by a `correlationId` and tracked DIRECT-to-Kafka so it is linkable in the lake and the Command Center member timeline.
+For surfaces that *ask* "what should I show this member right now?" (a portal, an agent screen, an inbound caller), the Action Library serves from Redis directly — no send. The top **eligible** served action now also starts the **standard journey workflow** (a `preDispatched` router CREATE — skips debounce/throttle/dispatch, straight to `IN_PROCESS` + disposition tracking + the standard TTL → `EXPIRED`; see [inbound-state-machine.md](inbound-state-machine.md)), with `IN_PROCESS` optimistically hot-patched into the Redis snapshot so the UI reads it instantly. The serve → disposition → completion journey is stitched together by a `correlationId` (dispositions route to the workflow via `trackingId`) and tracked DIRECT-to-Kafka so it is linkable in the lake and the Command Center member timeline.
 
 ```mermaid
 sequenceDiagram

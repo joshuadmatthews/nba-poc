@@ -88,7 +88,7 @@ Redis hash `nba:snapshot:{nbaId}` (`HGETALL`); the `nba.snapshots` topic message
 `buildSnapshotJson` (`{nbaId, entityType, entityId, correlationId, updatedTs, facts:{key→fv}}`, `fact:` prefix
 stripped, a fresh `correlationId` per build). Every fact value is the **4-field fv** `{value, valueType,
 eventTs, source}` and nothing more — note the disposition below keeps only those four; its richer bus fields
-(`state`, `channel`, `contentKey`, `trackingId`, `correlationId`) ride the message, not the snapshot. `nba.score.*`
+(`channel`, `contentKey`, `trackingId`, `correlationId`) ride the message, not the snapshot. `nba.score.*`
 is flattened to its bare numeric `.score` (valueType `DOUBLE`).
 
 ### Stage 1 — newly accreted, scored, ready for the forced onboarding email  (14 fields)
