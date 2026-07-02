@@ -35,6 +35,7 @@ $ARGS = @(
     '--network', 'aiservices_default', '--network-alias', 'nba-bff',
     '-p', '4000:4000', '--restart', 'unless-stopped', '--label', 'ais.boot.wave=16',
     '-e', 'PORT=4000', '-e', 'NBA_ACTIONLIB_URL=http://nba-action-library:7001', '-e', 'NBA_LAKE_NS=workspace.nba_poc',
+    '-e', 'NBA_PG_HOST=ais-nba-postgres', '-e', 'NBA_REDIS_HOST=nba-redis',   # the library (authoring) lives in this BFF now
     # Analytics read off Lakebase Postgres (scale-to-zero) — the whole UI runs with the SQL warehouse stopped.
     # Remove these to fall back to the warehouse. DBX creds below still mint the Lakebase credential.
     '-e', 'NBA_LAKEBASE_HOST=<your-lakebase-host>',

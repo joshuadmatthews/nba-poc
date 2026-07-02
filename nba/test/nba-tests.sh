@@ -87,11 +87,11 @@ nbaid(){ R get "nba:idmap:OPERATOR:$1"; }
 next_action(){ podman exec ais-nba-bff wget -qO- "http://nba-action-library:7001/next-action/$1?n=3" 2>/dev/null; }
 inbound_disp(){ podman exec ais-nba-bff wget -qO- --post-data="{\"entityId\":\"$1\",\"actionId\":\"$2\",\"channel\":\"$3\",\"status\":\"$4\"}" --header="Content-Type: application/json" http://nba-action-library:7001/dispositions 2>/dev/null; }
 # operator suppress/unsuppress an action (D) — Command Center -> action-library /suppress
-al_suppress(){ podman exec ais-nba-bff wget -qO- --post-data="{\"actionId\":\"$1\",\"suppressed\":$2}" --header="Content-Type: application/json" http://nba-action-library:7001/suppress >/dev/null 2>&1; }
-al_suppress_ch(){ podman exec ais-nba-bff wget -qO- --post-data="{\"actionId\":\"$1\",\"channel\":\"$2\",\"suppressed\":$3}" --header="Content-Type: application/json" http://nba-action-library:7001/suppress >/dev/null 2>&1; }
-al_maxbatch(){ podman exec ais-nba-bff wget -qO- --post-data="{\"channel\":\"$1\",\"maxBatch\":$2}" --header="Content-Type: application/json" http://nba-action-library:7001/channel-config >/dev/null 2>&1; }
+al_suppress(){ podman exec ais-nba-bff wget -qO- --post-data="{\"actionId\":\"$1\",\"suppressed\":$2}" --header="Content-Type: application/json" http://nba-bff:4000/suppress >/dev/null 2>&1; }
+al_suppress_ch(){ podman exec ais-nba-bff wget -qO- --post-data="{\"actionId\":\"$1\",\"channel\":\"$2\",\"suppressed\":$3}" --header="Content-Type: application/json" http://nba-bff:4000/suppress >/dev/null 2>&1; }
+al_maxbatch(){ podman exec ais-nba-bff wget -qO- --post-data="{\"channel\":\"$1\",\"maxBatch\":$2}" --header="Content-Type: application/json" http://nba-bff:4000/channel-config >/dev/null 2>&1; }
 # create an action from raw JSON (echoes the stored doc incl. its id); delete via the BFF graphql (action-lib DELETE)
-al_post_action(){ podman exec ais-nba-bff wget -qO- --post-data="$1" --header="Content-Type: application/json" http://nba-action-library:7001/actions 2>/dev/null; }
+al_post_action(){ podman exec ais-nba-bff wget -qO- --post-data="$1" --header="Content-Type: application/json" http://nba-bff:4000/actions 2>/dev/null; }
 al_del_action(){ podman exec ais-nba-bff wget -qO- --post-data="{\"query\":\"mutation{ deleteAction(id:\\\"$1\\\") }\"}" --header="Content-Type: application/json" http://nba-bff:4000/graphql >/dev/null 2>&1; }
 # HARD completion API signal (partner/lake-fallback path): nba.completion.{actionId}=completed via the outbox.
 al_completion(){ podman exec ais-nba-bff wget -qO- --post-data="{\"entityId\":\"$1\",\"actionId\":\"$2\",\"source\":\"int-test\"}" --header="Content-Type: application/json" http://nba-action-library:7001/completion >/dev/null 2>&1; }
@@ -280,7 +280,7 @@ C0="operator.comms.totalThisWeek:0:LONG"; E0="operator.comms.emailsThisWeek:0:LO
 # VariantTest's EMPTY inclusion makes it eligible for EVERY member, breaking nearly every assertion.
 # Deterministic isolation: the suite must start from only the seeded fixtures.
 echo "== cleaning up leaked test-fixture actions (VariantTest / ComplCrit / ComplNoExcl / ExpireTest) =="
-for leaked in $(podman exec ais-nba-bff wget -qO- http://nba-action-library:7001/actions 2>/dev/null | python -c "import json,sys; print('\n'.join(a['id'] for a in json.load(sys.stdin) if a.get('name') in ('VariantTest','ComplCrit','ComplNoExcl','ExpireTest')))" 2>/dev/null); do
+for leaked in $(podman exec ais-nba-bff wget -qO- http://nba-bff:4000/actions 2>/dev/null | python -c "import json,sys; print('\n'.join(a['id'] for a in json.load(sys.stdin) if a.get('name') in ('VariantTest','ComplCrit','ComplNoExcl','ExpireTest')))" 2>/dev/null); do
   echo "  deleting leaked $leaked"; al_del_action "$leaked"
 done
 sleep 3

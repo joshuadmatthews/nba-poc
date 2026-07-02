@@ -136,7 +136,7 @@ Full spec in [03-state-machine.md](03-state-machine.md). Summary: one `ChannelAc
 
 `nba/services/action-layer/.../ActionLayer.java` · container `ais-nba-action-layer` · boot wave 21
 
-**Purpose.** The single send point and the "disposition brain" — the only component that knows what a provider's raw status means.
+**Purpose.** The single send point — a dumb provider adapter. It REPORTS each provider's raw status on the disposition fact; what a raw status *means* for the lifecycle is owned by the state machine (`DispositionClassifier`).
 
 **I/O.** In: `nba.activations` (group `action-layer`, offset `latest` — live activations only). Out: `nba.member.facts` `kind=disposition`. DLQ `nba.dlq.action-layer`.
 
@@ -148,32 +148,29 @@ Full spec in [03-state-machine.md](03-state-machine.md). Summary: one `ChannelAc
 
 ---
 
-## Action Library
+## Action API (runtime serve/disposition surface)
 
 `nba/services/action-library/.../ActionLibrary.java` · container `ais-nba-action-library:7001` · Javalin · boot wave 16
 
-**Purpose.** Authoring + inbound pull-serve boundary + the synchronous HOT PATH. Stores definitions in Postgres; publishes via the transactional outbox; serves a member's actions for a requesting channel; and — when live context is presented — runs a self-contained decision (snapshot + gold features → eligibility → score) instead of reading the cached eval. Design framing: **the API is JUST the hot path** — an optimistic accelerator over Kafka + the snapshot-builder, which remain the source of truth.
+**Purpose.** The pure RUNTIME surface: serve a member's actions (getActions) and record dispositions/completions (postDispositions) — plus the synchronous HOT PATH. **All AUTHORING moved to the Command Center** (`command-center/bff/library.js`): definitions CRUD, taxonomy (groups/experiences), operator suppress, channel config and the fact-type catalog are the control plane and live there, against the same Postgres + outbox. Design framing: **this API is JUST the hot path** — an optimistic accelerator over Kafka + the snapshot-builder, which remain the source of truth.
 
 **Consistency.** Writes nothing to Kafka directly — every emission is an INSERT into `outbox_defs` in the same Postgres transaction as the business write; Debezium routes by `aggregatetype` → topic, `aggregateid` → key, `kind` → header, `payload` → value (`null` = tombstone).
 
-**Postgres.** Tables `action`, `global_rule`, `channel_rule`, `milestone` (JSONB docs), `outbox_defs`, `action_group` (adjacency tree), `experience`. `factsUsed` is auto-derived (recursive `collectFacts` over inclusion/exclusion/logic/variants/completion).
+**Postgres.** Owns only `outbox_defs` writes (dispositions/completions). The definitions/taxonomy tables (`action`, `global_rule`, `channel_rule`, `milestone`, `action_group`, `experience`) are OWNED by the Command Center library; this service only READS `action` for its serve-time catalog (60s cache; tolerates absence until the CC boots).
 
 **Key endpoints.**
 
 | Method · Path | Purpose |
 |---|---|
 | `GET /health` | liveness |
-| `POST/PUT/GET/DELETE /actions[/{id}]` | author actions; `/actions/{id}/group`, `/actions/{id}/experience` |
-| `POST/PUT/GET/DELETE /global-rules`, `/channel-rules`, `/milestones` | author rules/milestones |
 | `GET /next-action/{entityId}?channel=&n=&includeCompleted=` | **inbound pull serve.** Returns ALL of the channel's actions (default `n=ALL`, was top-1), each with a `state` ∈ `eligible`/`active`/`completed`. No `{facts}` body → serves from the cached eligibility object (`nba:eligibility:{nbaId}`: eligible, not suppressed, by score). A `{facts}` body → runs the synchronous **HOT PATH** (`hotPathDecide`: merge snapshot + presented facts → eligibility → score) so the served NBAs reflect the just-given inbound topic. `includeCompleted=true` also surfaces the `completed[]` actions (which otherwise prune out of channelActions). Stamps one `correlationId` on the served set + emits an `INBOUND_SERVE` tracking event. The top **eligible** action also starts the standard journey (`startInboundJourney`: a `preDispatched` router CREATE keyed like any outbound + an optimistic `IN_PROCESS` hot-patch into the Redis snapshot). |
 | `POST /disposition` | **THE FAST PATH** (singular). `{entityId, actionId, channel, status?, facts?, mode?=kie\|inproc, n?, writeback?, correlationId?}` → `hotPathDecide` (merges the inbound disposition first) → ranked NBAs synchronously; durable write-back via the outbox AFTER responding (off the latency path). Links the prior serve's `correlationId` + emits `INBOUND_DISPOSITION`, then stamps a NEW `correlationId` on the next-served set + emits its `INBOUND_SERVE`. |
 | `POST /dispositions` | inbound disposition → outbox `nba.member.facts` `kind=disposition` (the durable, async, no-decision variant). Carries a `trackingId` (`nba-ca:{nbaId}:{action}:{channel}\|{correlationId}`) so the raw status routes to the member's journey workflow, plus an optimistic snapshot hot-patch. |
 | `POST /completion` | hard-completion signal → outbox `kind=completion` (channel-agnostic): the durable `nba.completion.{actionId}` fact — the SAME fact the router emits on outbound completion. |
-| `POST /suppress` · `GET /suppressed` | operator suppression → `ACTION_SUPPRESS:{target}` |
-| `POST/GET /channel-config` | per-channel `maxBatch` (Redis `nba:channel:maxbatch`) |
-| `GET/POST/DELETE /groups`, `/experiences` | taxonomy |
 
-**Definitions cache.** A daemon (own random group, replays compacted `nba.definitions`) keeps `SUPPRESSED` + `nba:suppressed` current and triggers `recomputeRuleFacts` (union of all `factsUsed` from Postgres → `nba:rulefacts`). The topic events only *trigger* the recompute; Postgres is the source of truth.
+*(Authoring — `/actions`, `/global-rules`, `/channel-rules`, `/milestones`, `/groups`, `/experiences`, `/suppress`, `/channel-config`, `/facts` — moved to the **Command Center** on :4000, same paths; see [07-command-center.md](07-command-center.md).)*
+
+**Definitions cache.** A daemon (own random group, replays compacted `nba.definitions`) keeps `SUPPRESSED` + `nba:suppressed` current for the serve-time strip. (`nba:rulefacts` is owned by the Command Center library now — it recomputes from Postgres on every def mutation.)
 
 **Hot-path decision core** (`hotPathDecide`). Shared by the `POST /disposition` fast path and the `GET /next-action` hot path (facts given). Steps: (1) read `nba:snapshot:{nbaId}` (loop state — dispositions/completions/milestones); (2) read the ~30 rich model features STRAIGHT from gold (`goldFeatures`, below); (3) LWW-merge features + snapshot facts + the inbound disposition + presented facts (event-time) into a structured node (for the model) and a flat map (for KIE); (4) eligibility (`mode=kie` via KIE server, or `inproc`), then strip operator-suppressed; (5) score via the local `nba-model` (`scorer=local`, default) or the Databricks Model Serving endpoint (`scorer=dbx`); (6) rank top-`n`. Returns `{nbaId, channel, mode, scorer, eligibleCount, featureSource, nbas[], timings{}}` — `timings` carries per-stage ms (snapshot/features/merge/elig/score/total). `channel` null/blank scores ALL eligible channels.
 

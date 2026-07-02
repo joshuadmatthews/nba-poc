@@ -11,16 +11,66 @@ import { buildFunnel } from './rulesql.js';
 import { startConsumer, addSubscriber, recentForNode, liveStats, TOPOLOGY, stateCounts, CANONICAL_STATES } from './eventstream.js';
 import { dlqStats, replayDlq, flushDlq, startDlqTracker } from './dlq.js';
 import { explainEligibility } from './explain.js';
+import * as library from './library.js';
 const esc = (s) => String(s).replace(/'/g, "''");
 
 const API = (process.env.NBA_ACTIONLIB_URL || 'http://nba-action-library:7001').replace(/\/$/, '');
 
+
+// AUTHORING lives HERE now (the command center owns the library — definitions/taxonomy/suppress/config in
+// Postgres + the outbox; see library.js). api() stays the single funnel the resolvers call: authoring paths
+// dispatch to the local library; everything else (runtime reads: /next-action, /snapshot, ...) still proxies
+// to the ACTION API, which is now a pure serve/disposition surface.
 async function api(path, opts = {}) {
+  const local = await localLibrary(path, opts);
+  if (local !== undefined) return local;
   const r = await fetch(API + path, { headers: { 'Content-Type': 'application/json' }, ...opts });
   if (r.status === 404) return null;
   const t = await r.text();
   if (!r.ok) throw new Error(t ? t.slice(0, 200) : `actionlib ${path}: ${r.status}`);   // surface the body (e.g. "group not empty")
   return t ? JSON.parse(t) : null;
+}
+
+// Local dispatch for the authoring surface (method + path -> library call). Returns undefined for
+// non-authoring paths (falls through to the action-API proxy above). 404 -> null, matching api()'s contract.
+const DEF_TABLES = { 'actions': ['action', 'ACTION'], 'global-rules': ['global_rule', 'GLOBAL_RULE'],
+                     'channel-rules': ['channel_rule', 'CHANNEL_RULE'], 'milestones': ['milestone', 'MILESTONE'] };
+async function localLibrary(path, opts = {}) {
+  const method = (opts.method || 'GET').toUpperCase();
+  const body = opts.body ? JSON.parse(opts.body) : {};
+  const p = decodeURIComponent(path.split('?')[0]).replace(/\/$/, '');
+  const seg = p.split('/').filter(Boolean);
+  const err404 = () => { const e = new Error('not_found'); e.status = 404; return e; };
+  try {
+    // /actions/{id}/group | /actions/{id}/experience (assignments re-emit the def via the outbox)
+    if (seg[0] === 'actions' && seg.length === 3 && method === 'POST') {
+      if (seg[2] === 'group') return await library.assignField(seg[1], 'groupId', body.groupId || null, 'action_group');
+      if (seg[2] === 'experience') return await library.assignField(seg[1], 'experienceId', body.experienceId || null, 'experience');
+    }
+    if (DEF_TABLES[seg[0]]) {
+      const [table, aggType] = DEF_TABLES[seg[0]];
+      if (seg.length === 1 && method === 'GET') return await library.listDefs(table);
+      if (seg.length === 1 && method === 'POST') return await library.upsertDef(table, aggType, body, null);
+      if (seg.length === 2 && method === 'PUT') return await library.upsertDef(table, aggType, body, seg[1]);
+      if (seg.length === 2 && method === 'GET') return await library.getDef(table, seg[1]);   // null on missing == api()'s 404
+      if (seg.length === 2 && method === 'DELETE') return await library.deleteDef(table, aggType, seg[1]);
+    }
+    if (p === '/facts' && method === 'GET') return await library.facts();
+    if (p === '/suppress' && method === 'POST') return await library.suppress(body.actionId, body.channel || '', body.suppressed !== false);
+    if (p === '/suppressed' && method === 'GET') return await library.suppressed();
+    if (p === '/channel-config' && method === 'GET') return await library.channelConfig();
+    if (p === '/channel-config' && method === 'POST') return await library.setChannelConfig(body.channel, body.maxBatch);
+    if (p === '/groups' && method === 'GET') return await library.listGroups();
+    if (p === '/groups' && method === 'POST') return await library.createGroup(body.name, body.parentId);
+    if (seg[0] === 'groups' && seg.length === 2 && method === 'DELETE') return await library.deleteGroup(seg[1]);
+    if (p === '/experiences' && method === 'GET') return await library.listExperiences();
+    if (p === '/experiences' && method === 'POST') return await library.createExperience(body.name, body.description);
+    if (seg[0] === 'experiences' && seg.length === 2 && method === 'DELETE') return await library.deleteExperience(seg[1]);
+  } catch (e) {
+    if (e.status === 404) return null;
+    throw e;
+  }
+  return undefined;   // not an authoring path -> proxy to the action API
 }
 
 const typeDefs = `#graphql
@@ -684,7 +734,15 @@ app.get('/stream', (req, res) => {
   addSubscriber(res);
 });
 
+// The authoring REST surface (the routes the action API used to expose) — now served here, on the command
+// center, straight from the library module. Scripts/partners that authored against :7001 point here instead.
+app.use(library.router(express));
+
 const PORT = Number(process.env.PORT || 4000);
-app.listen(PORT, '0.0.0.0', () => console.log('[command-center-bff] up :' + PORT + ' -> actionlib ' + API + ' | lake ' + (lakeConfigured ? `${backend}:${NS}` : 'NOT CONFIGURED')));
+library.init()
+  .then(() => app.listen(PORT, '0.0.0.0', () => console.log('[command-center-bff] up :' + PORT
+      + ' | library: LOCAL (authoring owned here) | runtime -> ' + API
+      + ' | lake ' + (lakeConfigured ? `${backend}:${NS}` : 'NOT CONFIGURED'))))
+  .catch((e) => { console.error('[command-center-bff] library init failed:', e); process.exit(1); });
 startConsumer();
 startDlqTracker();

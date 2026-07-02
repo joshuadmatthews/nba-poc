@@ -153,28 +153,11 @@ public class ActionLibrary {
         app.get("/health", c -> c.result("ok"));
         app.get("/metrics", c -> c.contentType("text/plain; version=0.0.4; charset=utf-8").result(Metrics.scrape()));
 
-        // canonical fact-type catalog (nba:facttype): {factKey: BOOL|LONG|DOUBLE|STRING}. The rule-builder UI
-        // constrains operator options by it; upsert() validates every rule operator against it.
-        app.get("/facts", c -> c.json(M.valueToTree(redis.hgetAll("nba:facttype"))));
-
-        // actions (id, name, ttlSeconds, channels:[{channel,contentKey}], inclusion, exclusion)
-        app.post("/actions", c -> upsert(c, "action", "ACTION"));
-        app.put("/actions/{id}", c -> upsert(c, "action", "ACTION"));
-        app.get("/actions", c -> list(c, "action"));
-        app.get("/actions/{id}", c -> get(c, "action"));
-        app.delete("/actions/{id}", c -> delete(c, "action", "ACTION"));
-
-        // global rules (id, name, logic)
-        app.post("/global-rules", c -> upsert(c, "global_rule", "GLOBAL_RULE"));
-        app.put("/global-rules/{id}", c -> upsert(c, "global_rule", "GLOBAL_RULE"));
-        app.get("/global-rules", c -> list(c, "global_rule"));
-        app.delete("/global-rules/{id}", c -> delete(c, "global_rule", "GLOBAL_RULE"));
-
-        // channel rules (id, channel, name, logic)
-        app.post("/channel-rules", c -> upsert(c, "channel_rule", "CHANNEL_RULE"));
-        app.put("/channel-rules/{id}", c -> upsert(c, "channel_rule", "CHANNEL_RULE"));
-        app.get("/channel-rules", c -> list(c, "channel_rule"));
-        app.delete("/channel-rules/{id}", c -> delete(c, "channel_rule", "CHANNEL_RULE"));
+        // ── AUTHORING MOVED TO THE COMMAND CENTER (bff/library.js) ─────────────────────────────
+        // Definitions CRUD (/actions, /global-rules, /channel-rules, /milestones), taxonomy (/groups,
+        // /experiences), operator /suppress, /channel-config and /facts are the CONTROL PLANE and are
+        // served by the command-center API against the same Postgres + outbox. This service is the pure
+        // RUNTIME surface: serve actions + record dispositions/completions (getActions/postDispositions).
 
         // ---- INBOUND (pull) — serve the next best action(s) from the eval CACHE (Redis).
         app.get("/next-action/{entity}", c -> { Metrics.counter("nba_serve_requests_total", "route", "next-action").increment(); nextAction(c, redis); });
@@ -185,220 +168,10 @@ public class ActionLibrary {
         // ---- HARD COMPLETION (API / partner / lake fallback) — signal the member did the action's goal.
         app.post("/completion", c -> { Metrics.counter("nba_completions_total").increment(); recordCompletion(c, redis); });
 
-        // ---- OPERATOR suppress (Command Center) — pull an ACTION or ACTION-CHANNEL out of rotation.
-        app.post("/suppress", c -> suppressAction(c));
-        app.get("/suppressed", c -> c.json(M.valueToTree(redis.smembers("nba:suppressed"))));
 
-        // ---- channel CONFIG: max batch per channel (Command Center). Read by the action-router from Redis.
-        app.post("/channel-config", c -> {
-            JsonNode b = M.readTree(c.body());
-            String ch = b.path("channel").asText("");
-            int mb = Math.max(1, b.path("maxBatch").asInt(1));
-            if (ch.isEmpty()) { c.status(400).result("channel required"); return; }
-            redis.hset("nba:channel:maxbatch", ch, String.valueOf(mb));
-            log.info("channel-config " + ch + " maxBatch=" + mb);
-            c.json(M.createObjectNode().put("channel", ch).put("maxBatch", mb));
-        });
-        app.get("/channel-config", c -> c.json(M.valueToTree(redis.hgetAll("nba:channel:maxbatch"))));
-
-        // ---- ACTION GROUPS (taxonomy tree). Assign actions to a group, browse a group's actions (the UI
-        // rolls up descendants), add groups, delete EMPTY ones. Groups are command-center metadata only.
-        app.get("/groups", c -> listGroups(c));                       // [{id,name,parentId}]
-        app.post("/groups", c -> createGroup(c));                     // {name, parentId?} -> group
-        app.delete("/groups/{id}", c -> deleteGroup(c));              // 409 if it has children or actions
-        app.post("/actions/{id}/group", c -> assignGroup(c));         // {groupId?} -> sets/clears doc.groupId (+ outbox)
-
-        // ---- EXPERIENCES (business-journey taxonomy, flat) — same shape as groups but no tree.
-        app.get("/experiences", c -> listExperiences(c));             // [{id,name,description}]
-        app.post("/experiences", c -> createExperience(c));           // {name, description?} -> experience
-        app.delete("/experiences/{id}", c -> deleteExperience(c));    // 409 if any action is assigned
-        app.post("/actions/{id}/experience", c -> assignExperience(c)); // {experienceId?} -> sets/clears doc.experienceId (+ outbox)
-
-        // ---- MILESTONES (def: name + structured logic). Reuses the def pipeline: upsert/delete write the
-        // doc + an outbox row -> Debezium -> nba.definitions MILESTONE:{id}; the rules engine evaluates + latches.
-        app.post("/milestones", c -> upsert(c, "milestone", "MILESTONE"));
-        app.put("/milestones/{id}", c -> upsert(c, "milestone", "MILESTONE"));
-        app.get("/milestones", c -> list(c, "milestone"));
-        app.delete("/milestones/{id}", c -> delete(c, "milestone", "MILESTONE"));
     }
 
-    // ---- experiences (flat taxonomy; an action's experience = doc.experienceId) ----
-    static void listExperiences(Context c) throws Exception {
-        ArrayNode arr = M.createArrayNode();
-        try (Connection conn = ds.getConnection(); Statement st = conn.createStatement();
-             ResultSet rs = st.executeQuery("select id, name, description from experience order by name")) {
-            while (rs.next()) {
-                ObjectNode x = arr.addObject();
-                x.put("id", rs.getString(1)); x.put("name", rs.getString(2));
-                String d = rs.getString(3); if (d == null) x.putNull("description"); else x.put("description", d);
-            }
-        }
-        c.json(arr);
-    }
 
-    static void createExperience(Context c) throws Exception {
-        JsonNode b = M.readTree(c.body());
-        String name = b.path("name").asText("").trim();
-        String desc = b.hasNonNull("description") ? b.get("description").asText() : null;
-        if (name.isEmpty()) { c.status(400).result("name required"); return; }
-        String id = "exp_" + UUID.randomUUID().toString().substring(0, 8);
-        try (Connection conn = ds.getConnection();
-             PreparedStatement ps = conn.prepareStatement("insert into experience(id, name, description) values (?, ?, ?)")) {
-            ps.setString(1, id); ps.setString(2, name);
-            if (desc == null) ps.setNull(3, java.sql.Types.VARCHAR); else ps.setString(3, desc);
-            ps.executeUpdate();
-        }
-        ObjectNode x = M.createObjectNode().put("id", id).put("name", name);
-        if (desc == null) x.putNull("description"); else x.put("description", desc);
-        log.info("experience + " + id + " '" + name + "'");
-        c.json(x);
-    }
-
-    /** Delete an experience only if no action is assigned to it. 409 otherwise. */
-    static void deleteExperience(Context c) throws Exception {
-        String id = c.pathParam("id");
-        try (Connection conn = ds.getConnection()) {
-            long actions = scalar(conn, "select count(*) from action where doc->>'experienceId' = ?", id);
-            if (actions > 0) { c.status(409).json(M.createObjectNode().put("error", "experience not empty").put("actions", actions)); return; }
-            try (PreparedStatement ps = conn.prepareStatement("delete from experience where id = ?")) {
-                ps.setString(1, id);
-                if (ps.executeUpdate() == 0) { c.status(404).result("experience not found"); return; }
-            }
-        }
-        log.info("experience - " + id);
-        c.json(M.createObjectNode().put("deleted", id));
-    }
-
-    /** Assign (or clear) an action's experience — updates doc.experienceId + re-emits the def via outbox. */
-    static void assignExperience(Context c) throws Exception {
-        String actionId = c.pathParam("id");
-        JsonNode b = M.readTree(c.body());
-        String experienceId = b.hasNonNull("experienceId") ? b.get("experienceId").asText() : null;
-        if (experienceId != null && experienceId.isBlank()) experienceId = null;
-        try (Connection conn = ds.getConnection()) {
-            conn.setAutoCommit(false);
-            ObjectNode doc;
-            try (PreparedStatement ps = conn.prepareStatement("select doc from action where id = ?")) {
-                ps.setString(1, actionId);
-                try (ResultSet rs = ps.executeQuery()) {
-                    if (!rs.next()) { c.status(404).result("action not found: " + actionId); return; }
-                    doc = (ObjectNode) M.readTree(rs.getString(1));
-                }
-            }
-            if (experienceId != null) {
-                try (PreparedStatement ck = conn.prepareStatement("select 1 from experience where id = ?")) {
-                    ck.setString(1, experienceId);
-                    try (ResultSet rs = ck.executeQuery()) { if (!rs.next()) { c.status(400).result("experience not found: " + experienceId); return; } }
-                }
-            }
-            if (experienceId == null) doc.remove("experienceId"); else doc.put("experienceId", experienceId);
-            try (PreparedStatement up = conn.prepareStatement("update action set doc = ?::jsonb, updated_at = now() where id = ?")) {
-                up.setString(1, M.writeValueAsString(doc)); up.setString(2, actionId); up.executeUpdate();
-            }
-            outbox(conn, DEFS_TOPIC, "ACTION:" + actionId, null, M.writeValueAsString(doc));
-            conn.commit();
-        }
-        log.info("action " + actionId + " -> experience " + (experienceId == null ? "(none)" : experienceId));
-        c.json(M.createObjectNode().put("id", actionId).put("experienceId", experienceId == null ? "" : experienceId));
-    }
-
-    static void listGroups(Context c) throws Exception {
-        ArrayNode arr = M.createArrayNode();
-        try (Connection conn = ds.getConnection(); Statement st = conn.createStatement();
-             ResultSet rs = st.executeQuery("select id, name, parent_id from action_group order by name")) {
-            while (rs.next()) {
-                ObjectNode g = arr.addObject();
-                g.put("id", rs.getString(1)); g.put("name", rs.getString(2));
-                String p = rs.getString(3); if (p == null) g.putNull("parentId"); else g.put("parentId", p);
-            }
-        }
-        c.json(arr);
-    }
-
-    static void createGroup(Context c) throws Exception {
-        JsonNode b = M.readTree(c.body());
-        String name = b.path("name").asText("").trim();
-        String parentId = b.hasNonNull("parentId") ? b.get("parentId").asText() : null;
-        if (parentId != null && parentId.isBlank()) parentId = null;
-        if (name.isEmpty()) { c.status(400).result("name required"); return; }
-        String id = "grp_" + UUID.randomUUID().toString().substring(0, 8);
-        try (Connection conn = ds.getConnection()) {
-            if (parentId != null && !groupExists(conn, parentId)) { c.status(400).result("parent group not found: " + parentId); return; }
-            try (PreparedStatement ps = conn.prepareStatement("insert into action_group(id, name, parent_id) values (?, ?, ?)")) {
-                ps.setString(1, id); ps.setString(2, name);
-                if (parentId == null) ps.setNull(3, java.sql.Types.VARCHAR); else ps.setString(3, parentId);
-                ps.executeUpdate();
-            }
-        }
-        ObjectNode g = M.createObjectNode();
-        g.put("id", id); g.put("name", name);
-        if (parentId == null) g.putNull("parentId"); else g.put("parentId", parentId);
-        log.info("group + " + id + " '" + name + "'" + (parentId != null ? " under " + parentId : ""));
-        c.json(g);
-    }
-
-    /** Delete a group ONLY if empty — no child groups AND no actions assigned to it. 409 otherwise. */
-    static void deleteGroup(Context c) throws Exception {
-        String id = c.pathParam("id");
-        try (Connection conn = ds.getConnection()) {
-            long children = scalar(conn, "select count(*) from action_group where parent_id = ?", id);
-            long actions = scalar(conn, "select count(*) from action where doc->>'groupId' = ?", id);
-            if (children > 0 || actions > 0) {
-                c.status(409).json(M.createObjectNode().put("error", "group not empty")
-                        .put("childGroups", children).put("actions", actions));
-                return;
-            }
-            try (PreparedStatement ps = conn.prepareStatement("delete from action_group where id = ?")) {
-                ps.setString(1, id);
-                if (ps.executeUpdate() == 0) { c.status(404).result("group not found"); return; }
-            }
-        }
-        log.info("group - " + id);
-        c.json(M.createObjectNode().put("deleted", id));
-    }
-
-    /** Assign (or clear, groupId=null) an action's group. Updates the action doc + re-emits the def via the
-     *  SAME outbox transaction, so the def stays consistent (groupId rides the doc; the rules engine ignores it). */
-    static void assignGroup(Context c) throws Exception {
-        String actionId = c.pathParam("id");
-        JsonNode b = M.readTree(c.body());
-        String groupId = b.hasNonNull("groupId") ? b.get("groupId").asText() : null;
-        if (groupId != null && groupId.isBlank()) groupId = null;
-        try (Connection conn = ds.getConnection()) {
-            conn.setAutoCommit(false);
-            ObjectNode doc;
-            try (PreparedStatement ps = conn.prepareStatement("select doc from action where id = ?")) {
-                ps.setString(1, actionId);
-                try (ResultSet rs = ps.executeQuery()) {
-                    if (!rs.next()) { c.status(404).result("action not found: " + actionId); return; }
-                    doc = (ObjectNode) M.readTree(rs.getString(1));
-                }
-            }
-            if (groupId != null && !groupExists(conn, groupId)) { c.status(400).result("group not found: " + groupId); return; }
-            if (groupId == null) doc.remove("groupId"); else doc.put("groupId", groupId);
-            try (PreparedStatement up = conn.prepareStatement("update action set doc = ?::jsonb, updated_at = now() where id = ?")) {
-                up.setString(1, M.writeValueAsString(doc)); up.setString(2, actionId); up.executeUpdate();
-            }
-            outbox(conn, DEFS_TOPIC, "ACTION:" + actionId, null, M.writeValueAsString(doc));   // same tx
-            conn.commit();
-        }
-        log.info("action " + actionId + " -> group " + (groupId == null ? "(none)" : groupId));
-        c.json(M.createObjectNode().put("id", actionId).put("groupId", groupId == null ? "" : groupId));
-    }
-
-    static boolean groupExists(Connection conn, String id) throws Exception {
-        try (PreparedStatement ps = conn.prepareStatement("select 1 from action_group where id = ?")) {
-            ps.setString(1, id);
-            try (ResultSet rs = ps.executeQuery()) { return rs.next(); }
-        }
-    }
-
-    static long scalar(Connection conn, String sql, String arg) throws Exception {
-        try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, arg);
-            try (ResultSet rs = ps.executeQuery()) { return rs.next() ? rs.getLong(1) : 0; }
-        }
-    }
 
     // =====================================================================================
     // Derived-cache consumer: tail the compacted nba.definitions topic (single source of truth) and
@@ -408,7 +181,7 @@ public class ActionLibrary {
     // =====================================================================================
     static void startDefinitionsCache(String bootstrap, String defsTopic, JedisPooled redis) {
         try { SUPPRESSED.addAll(redis.smembers("nba:suppressed")); } catch (Exception ignore) {}   // warm floor
-        recomputeRuleFacts(redis);   // authoritative initial load from Postgres (complete even if topic payloads lag)
+        // (nba:rulefacts is OWNED by the command center now — it recomputes on every def mutation.)
         Thread t = new Thread(() -> {
             Properties cp = new Properties();
             cp.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap);
@@ -421,7 +194,6 @@ public class ActionLibrary {
             log.info("definitions cache up: " + defsTopic + " (derives suppressed; triggers rulefacts)");
             while (true) {
                 ConsumerRecords<String, String> recs = consumer.poll(Duration.ofMillis(500));
-                boolean defChanged = false;
                 for (ConsumerRecord<String, String> r : recs) {
                     String k = r.key();
                     if (k == null) continue;
@@ -431,72 +203,23 @@ public class ActionLibrary {
                         try { on = r.value() != null && M.readTree(r.value()).path("value").asBoolean(false); } catch (Exception ignore) {}
                         if (on) { SUPPRESSED.add(target); redis.sadd("nba:suppressed", target); }
                         else    { SUPPRESSED.remove(target); redis.srem("nba:suppressed", target); }
-                    } else if (isDefKey(k)) {
-                        defChanged = true;   // a def add/update/delete (incl. from another instance) -> recompute from DB
                     }
-                    // THROTTLE: / THROTTLE_HOT: -> not ours (rules engine + temporal handle the throttle level)
+                    // defs (ACTION:/GLOBAL_RULE:/...) -> nothing to do here; the COMMAND CENTER owns
+                    // nba:rulefacts and recomputes it on every def mutation. THROTTLE:* -> not ours.
                 }
-                if (defChanged) recomputeRuleFacts(redis);
             }
         }, "definitions-cache");
         t.setDaemon(true);
         t.start();
     }
 
-    static boolean isDefKey(String k) {
-        return k.startsWith("ACTION:") || k.startsWith("GLOBAL_RULE:") || k.startsWith("CHANNEL_RULE:");
-    }
 
-    /** nba:rulefacts = the union of factsUsed across every current def, queried straight from POSTGRES
-     *  (the authoritative store — topic payloads can carry stale factsUsed for defs not re-upserted since
-     *  that field was added). Topic def-changes only TRIGGER this recompute; the source is always the DB. */
-    static void recomputeRuleFacts(JedisPooled redis) {
-        String q = "select distinct f from (" +
-                "select jsonb_array_elements_text(doc->'factsUsed') f from action " +
-                "union all select jsonb_array_elements_text(doc->'factsUsed') f from global_rule " +
-                "union all select jsonb_array_elements_text(doc->'factsUsed') f from channel_rule " +
-                "union all select jsonb_array_elements_text(doc->'factsUsed') f from milestone) x";
-        try (Connection conn = ds.getConnection(); Statement st = conn.createStatement(); ResultSet rs = st.executeQuery(q)) {
-            Set<String> facts = new TreeSet<>();
-            while (rs.next()) { String f = rs.getString(1); if (f != null && !f.isBlank()) facts.add(f); }
-            redis.del("nba:rulefacts");
-            if (!facts.isEmpty()) redis.sadd("nba:rulefacts", facts.toArray(new String[0]));
-            log.info("nba:rulefacts -> " + facts);
-        } catch (Exception e) {
-            log.warn("rulefacts recompute failed", e);
-        }
-    }
 
     // =====================================================================================
     // Operator suppress + inbound disposition: outbox-only (Debezium emits), no direct Kafka, no Redis.
     // =====================================================================================
 
-    static void suppressAction(Context c) throws Exception {
-        JsonNode b = M.readTree(c.body());
-        String actionId = b.path("actionId").asText("");
-        String channel = b.path("channel").asText("");          // empty -> whole action; else action-channel
-        boolean suppressed = b.path("suppressed").asBoolean(true);
-        if (actionId.isEmpty()) { c.status(400).result("actionId required"); return; }
-        String target = channel.isEmpty() ? actionId : actionId + "." + channel;
-        String key = "nba.actionsuppress." + target;
-        ObjectNode fact = M.createObjectNode();
-        fact.put("entityType", "SYSTEM"); fact.put("entityId", "__action");
-        fact.put("key", key); fact.put("value", suppressed); fact.put("valueType", "BOOL");
-        fact.put("actionId", actionId); fact.put("channel", channel);
-        fact.put("eventTs", System.currentTimeMillis()); fact.put("source", "operator");
-        // Outbox -> Debezium routes ACTION_SUPPRESS:{target} to the definitions topic; the rules engine + this
-        // service's definitions cache pick it up. The in-memory SUPPRESSED / nba:suppressed update on that
-        // round-trip (single source of truth), so there's no dual write to drift.
-        // Single write: the ACTION_SUPPRESS flag on the definitions broadcast. It IS the trigger — the temporal
-        // worker's suppress-feed (and the Flink state machine) tail nba.definitions and fan the in-flight cancel out
-        // via the SuppressionWorkflow on the false->true transition. This ACTION-LEVEL signal rides a low-volume
-        // channel, so it fires immediately instead of queuing behind the high-volume member.facts CREATE backlog.
-        try (Connection conn = ds.getConnection()) {
-            outbox(conn, DEFS_TOPIC, "ACTION_SUPPRESS:" + target, "action-suppress", M.writeValueAsString(fact));
-        }
-        log.info("operator " + (suppressed ? "SUPPRESS" : "UNSUPPRESS") + " " + target + " (outbox)");
-        c.json(fact);
-    }
+
 
     /** GET /next-action/{entity}?channel=&n=&includeCompleted= — serve a member's actions for a requesting channel/surface
      *  (e.g. website, salesforce, email). DEFAULT returns ALL eligible actions for the channel ranked by score (not just the
@@ -1338,101 +1061,7 @@ public class ActionLibrary {
         return out;
     }
 
-    static void upsert(Context c, String table, String aggType) throws Exception {
-        ObjectNode doc = (ObjectNode) M.readTree(c.body());
-        String id = c.pathParamMap().getOrDefault("id",
-                doc.hasNonNull("id") ? doc.get("id").asText() : null);
-        if (id == null || id.isBlank()) {
-            id = aggType.toLowerCase() + "_" + UUID.randomUUID().toString().substring(0, 8);
-        }
-        doc.put("id", id);
 
-        // TYPE-CORRECTNESS GATE: reject any rule operator that doesn't fit the fact's declared type (nba:facttype).
-        // Unknown facts pass (a new fact may be authored before it's catalogued); 'exists' fits any type.
-        try {
-            validateTree(doc.get("inclusion")); validateTree(doc.get("exclusion"));
-            validateTree(doc.get("logic")); validateTree(doc.get("completion"));
-            JsonNode chs = doc.get("channels");
-            if (chs != null && chs.isArray()) for (JsonNode ch : chs) {
-                JsonNode vs = ch.get("variants");
-                if (vs != null && vs.isArray()) for (JsonNode v : vs) validateTree(v.get("conditions"));
-            }
-        } catch (IllegalArgumentException ve) {
-            c.status(400).json(M.createObjectNode().put("error", ve.getMessage())); return;
-        }
-
-        Set<String> facts = new TreeSet<>();
-        collectFacts(doc.get("inclusion"), facts);
-        collectFacts(doc.get("exclusion"), facts);
-        collectFacts(doc.get("logic"), facts);
-        JsonNode channels = doc.get("channels");
-        if (channels != null && channels.isArray()) {
-            for (JsonNode chn : channels) {
-                JsonNode variants = chn.get("variants");
-                if (variants != null && variants.isArray())
-                    for (JsonNode v : variants) collectFacts(v.get("conditions"), facts);
-            }
-        }
-        // HARD COMPLETION (actions only): the `completion` tree is the goal criterion over member facts —
-        // its facts must ride the lean snapshot so the rules engine can evaluate + latch it. (The explicit
-        // nba.completion.{id} signal rides via the snapshot-builder's always-attach rule, not rulefacts.)
-        if ("ACTION".equals(aggType)) collectFacts(doc.get("completion"), facts);
-        ArrayNode fu = doc.putArray("factsUsed");
-        facts.forEach(fu::add);
-
-        try (Connection conn = ds.getConnection()) {
-            conn.setAutoCommit(false);
-            try (PreparedStatement ps = conn.prepareStatement(
-                    "insert into " + table + "(id, doc, updated_at) values (?, ?::jsonb, now()) " +
-                    "on conflict (id) do update set doc = excluded.doc, updated_at = now()")) {
-                ps.setString(1, id);
-                ps.setString(2, M.writeValueAsString(doc));
-                ps.executeUpdate();
-            }
-            // SAME transaction: Debezium routes ACTION:{id} (payload=doc) to the definitions topic.
-            outbox(conn, DEFS_TOPIC, aggType + ":" + id, null, M.writeValueAsString(doc));
-            conn.commit();
-        }
-        log.info("upsert " + table + " id=" + id + " factsUsed=" + facts);
-        c.json(doc);
-    }
-
-    static void list(Context c, String table) throws Exception {
-        try (Connection conn = ds.getConnection();
-             Statement st = conn.createStatement();
-             ResultSet rs = st.executeQuery("select doc from " + table + " order by updated_at desc")) {
-            ArrayNode arr = M.createArrayNode();
-            while (rs.next()) arr.add(M.readTree(rs.getString(1)));
-            c.json(arr);
-        }
-    }
-
-    static void get(Context c, String table) throws Exception {
-        String id = c.pathParam("id");
-        try (Connection conn = ds.getConnection();
-             PreparedStatement ps = conn.prepareStatement("select doc from " + table + " where id = ?")) {
-            ps.setString(1, id);
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) c.json(M.readTree(rs.getString(1)));
-                else c.status(404).json(M.createObjectNode().put("error", "not_found"));
-            }
-        }
-    }
-
-    static void delete(Context c, String table, String aggType) throws Exception {
-        String id = c.pathParam("id");
-        try (Connection conn = ds.getConnection()) {
-            conn.setAutoCommit(false);
-            try (PreparedStatement ps = conn.prepareStatement("delete from " + table + " where id = ?")) {
-                ps.setString(1, id);
-                ps.executeUpdate();
-            }
-            // SAME transaction: null payload -> Debezium emits a TOMBSTONE for ACTION:{id} on the compacted topic.
-            outbox(conn, DEFS_TOPIC, aggType + ":" + id, null, null);
-            conn.commit();
-        }
-        c.json(M.createObjectNode().put("deleted", id));
-    }
 
     /** Insert an outbox row in the caller's transaction (transactional outbox; Debezium relays it).
      *  aggregatetype = target topic, aggregateid = kafka key, kind -> 'kind' header, null payload = tombstone. */
@@ -1447,40 +1076,7 @@ public class ActionLibrary {
         }
     }
 
-    /** Recursively collect every "fact" key referenced in a structured condition tree. */
-    static void collectFacts(JsonNode node, Set<String> out) {
-        if (node == null || node.isNull()) return;
-        if (node.hasNonNull("fact")) out.add(node.get("fact").asText());
-        JsonNode conds = node.get("conditions");
-        if (conds != null && conds.isArray()) {
-            for (JsonNode child : conds) collectFacts(child, out);
-        }
-    }
 
-    /** Validate a condition tree against the fact-type catalog (nba:facttype). Mirrors collectFacts' walk.
-     *  Throws IllegalArgumentException on a type/operator mismatch; unknown facts + 'exists' are allowed. */
-    static void validateTree(JsonNode node) {
-        if (node == null || node.isNull()) return;
-        if (node.hasNonNull("fact")) {
-            String fact = node.get("fact").asText("");
-            String cmp = node.path("cmp").asText("eq");
-            if (!fact.isEmpty() && !"exists".equals(cmp)) {
-                String type = redis.hget("nba:facttype", fact);
-                if (type != null) {
-                    String t = type.toUpperCase();
-                    Set<String> ok;
-                    if (t.equals("BOOL") || t.equals("BOOLEAN")) ok = Set.of("eq", "ne", "exists");
-                    else if (t.equals("STRING")) ok = Set.of("eq", "ne", "in", "exists");
-                    else ok = Set.of("eq", "ne", "gt", "gte", "lt", "lte", "exists");   // LONG / DOUBLE / numeric
-                    if (!ok.contains(cmp))
-                        throw new IllegalArgumentException("fact '" + fact + "' is " + type +
-                            "; operator '" + cmp + "' is invalid (allowed: " + ok + ")");
-                }
-            }
-        }
-        JsonNode conds = node.get("conditions");
-        if (conds != null && conds.isArray()) for (JsonNode child : conds) validateTree(child);
-    }
 
     static HikariDataSource connectWithRetry(HikariConfig hc) throws InterruptedException {
         for (int i = 0; i < 30; i++) {
@@ -1497,22 +1093,12 @@ public class ActionLibrary {
     }
 
     static void initSchema() throws Exception {
+        // RUNTIME schema only: this service writes dispositions/completions through the transactional outbox.
+        // The definitions/taxonomy tables (action, global_rule, ..., action_group, experience, milestone) are
+        // OWNED by the command center (bff/library.js) — this service only READS `action` for its serve-time
+        // catalog (created by the command center; catalog() tolerates its absence until then).
         String[] ddl = {
-            "create table if not exists action       (id text primary key, doc jsonb not null, updated_at timestamptz not null default now())",
-            "create table if not exists global_rule  (id text primary key, doc jsonb not null, updated_at timestamptz not null default now())",
-            "create table if not exists channel_rule (id text primary key, doc jsonb not null, updated_at timestamptz not null default now())",
-            // transactional outbox (Debezium Outbox Event Router convention; shared nba-outbox connector tails it).
-            // payload NULL = tombstone for the compacted definitions topic (def delete).
-            "create table if not exists outbox_defs (id uuid primary key default gen_random_uuid(), aggregatetype text not null, aggregateid text not null, kind text, payload text, created_at timestamptz not null default now())",
-            // action GROUPS: a taxonomy TREE over actions (parent_id = adjacency list; NULL = root). An action's
-            // group is the `groupId` field on its doc. Pure command-center taxonomy — not on the Kafka pipeline.
-            "create table if not exists action_group (id text primary key, name text not null, parent_id text references action_group(id), updated_at timestamptz not null default now())",
-            // EXPERIENCES: a SECOND, business-facing taxonomy (enrollment, onboarding, …) that groups actions
-            // into member journeys. Flat. An action's experience is the `experienceId` field on its doc.
-            "create table if not exists experience (id text primary key, name text not null, description text, updated_at timestamptz not null default now())",
-            // MILESTONES: a def (name + structured logic, like a rule). The rules engine evaluates it per member
-            // and LATCHES completion permanently. Rides the def pipeline (-> nba.definitions MILESTONE:{id}).
-            "create table if not exists milestone (id text primary key, doc jsonb not null, updated_at timestamptz not null default now())"
+            "create table if not exists outbox_defs (id uuid primary key default gen_random_uuid(), aggregatetype text not null, aggregateid text not null, kind text, payload text, created_at timestamptz not null default now())"
         };
         try (Connection conn = ds.getConnection(); Statement st = conn.createStatement()) {
             for (String d : ddl) st.execute(d);

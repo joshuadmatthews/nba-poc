@@ -284,6 +284,24 @@ services:
       nba-redpanda: {condition: service_healthy}
       nba-topics: {condition: service_completed_successfully}
 
+  # ── command center: the CONTROL PLANE (authoring/library API + ops console BFF) ─────────────
+  # Owns the action library: definitions/taxonomy/suppress/channel-config in Postgres + the outbox
+  # (bff/library.js). The action API (nba-action-library) is the pure runtime surface. Lake/Databricks
+  # env is intentionally omitted (analytics tabs dark) — same local-only stance as the rest of the stack.
+  nba-bff:
+    <<: *svc
+    build: {context: ./services/command-center/bff, dockerfile: Containerfile}
+    environment:
+      PORT: "4000"
+      NBA_PG_HOST: nba-postgres
+      NBA_REDIS_HOST: nba-redis
+      NBA_ACTIONLIB_URL: http://nba-action-library:7001   # runtime reads still proxy to the action API
+    ports:
+      - "4000:4000"          # GraphQL (/graphql) + the authoring REST surface (/actions, /suppress, ...)
+    depends_on:
+      nba-postgres: {condition: service_healthy}
+      nba-redis: {condition: service_healthy}
+
   # ── one-shot seed: definitions + rulefacts + N demo members (network-native, no exec) ───────
   nba-seed:
     build: {context: ./infra/seed, dockerfile: Containerfile}

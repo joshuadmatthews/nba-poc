@@ -6,11 +6,12 @@ The Command Center is the operator surface: a live picture of the entire NBA sys
 flowchart LR
     UI[React UI :8490<br/>nginx] -->|/graphql · /topology · /stream| BFF[BFF :4000<br/>Apollo + SSE]
     BFF -->|tail 6 topics| K[(Redpanda)]
-    BFF -->|REST| AL[Action Library :7001]
+    BFF -->|owns| LIB[(Action Library — Postgres + outbox)]
+    BFF -->|REST (runtime reads)| AL[Action API :7001]
     BFF -->|SQL warehouse| DBX[(Databricks lake)]
 ```
 
-> **Without the lake.** The System Map, State Machine, Trace Replay, and all Studio authoring run entirely on the live Kafka stream + the Action Library REST API — **no Databricks**. Only the Analytics and Ops (Validation/Throughput) tabs require the warehouse; they show "lake offline" when Databricks is stopped (as it is overnight). The screenshots below are all lake-independent views.
+> **Without the lake.** The System Map, State Machine, Trace Replay, and all Studio authoring run entirely on the live Kafka stream + the BFF's OWN library (authoring lives in this BFF — `bff/library.js`, Postgres + outbox; the REST surface `/actions`, `/suppress`, … is served on :4000) — **no Databricks**. Only the Analytics and Ops (Validation/Throughput) tabs require the warehouse; they show "lake offline" when Databricks is stopped (as it is overnight). The screenshots below are all lake-independent views.
 
 ## The System Map (the centerpiece)
 
@@ -84,7 +85,7 @@ Overview KPIs + funnel + dispositions donut + score histogram; Action Performanc
 - **Throughput** — per-layer health vs a 7-day same-hour baseline; flags degraded/quiet.
 - **Dead-letter Queues** — per-consumer DLQ depth + last error; **Replay** (re-produce to source topic, then truncate) and **Flush** (truncate).
 
-### Studio (authoring → Action Library, lake-independent)
+### Studio (authoring → the BFF's library module, lake-independent)
 - **Actions** — full editor: channels (with content templates, soft-completion override, A/B variants with %-split + targeting conditions), inclusion/exclusion trees, completion goal (+ auto-exclude, hard TTL). Fact inputs autocomplete from the lake's `factLibrary` (free text allowed).
 - **Action Groups** — taxonomy tree (nestable). **Experiences** — flat journey labels. **Milestones / Global Rules / Channel Rules** — name + condition tree (channel rules typically encode throttle caps).
 

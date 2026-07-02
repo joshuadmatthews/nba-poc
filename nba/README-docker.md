@@ -32,7 +32,8 @@ cd nba
 | URL / command | what |
 |---|---|
 | http://localhost:8233 | Temporal Web UI (the `ChannelActionWorkflow` lifecycles) |
-| http://localhost:7001 | action-library API (authoring + inbound-serve / fast-path) |
+| http://localhost:7001 | action API (runtime: inbound-serve / dispositions / fast-path) |
+| http://localhost:4000 | command center BFF — GraphQL + the authoring REST surface (/actions, /suppress, …) |
 | `docker compose logs -f nba-temporal-worker` | watch activate / dispatch as the loop runs |
 | `docker compose exec nba-redis redis-cli --scan --pattern 'nba:snapshot:*' \| wc -l` | how many member snapshots exist |
 

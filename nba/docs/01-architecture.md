@@ -14,7 +14,7 @@
 | **Activation Layer** | Java 21 | `nba.activations` | `nba.member.facts` (`kind=disposition`) | Send exactly one comm; classify provider status into canonical dispositions. |
 | **Action Library** | Java 21 + Javalin | `nba.definitions` | `nba.definitions`, `nba.member.facts` via outbox; `nba.member.facts` (`source=hotpath`) + `nba.activations` direct | Author actions/rules; suppression; channel config; **the synchronous inbound HOT PATH** (`GET /next-action` with facts, `POST /disposition`) — merge-eligible-score on demand, optimistic Redis write-through, gold-direct feature read. |
 | **KIE Server** | Java 21 + Drools | `nba.definitions` | (HTTP) | Optional horizontal scale-out for Drools evaluation. |
-| **Command Center** | Node BFF + React | all NBA topics (tail), Databricks, Action Library | (SSE/GraphQL) | Live system map, analytics, authoring, ops. |
+| **Command Center** | Node BFF + React | all NBA topics (tail), Databricks, Postgres (it OWNS the action library — authoring/taxonomy/suppress via the outbox) | (SSE/GraphQL + the authoring REST surface) | Live system map, analytics, authoring, ops. |
 
 ## The data-flow loop (authoritative)
 
@@ -105,7 +105,7 @@ See [04-message-schemas.md](04-message-schemas.md) for the full catalog.
 
 2. **The state machine resolves races, not the router.** The router is a *blind bridge*: it can emit two `CREATE`s for the same member before the first round-trips. The Temporal state machine debounces and runs a sibling-dedup so exactly one send wins. (See [03-state-machine.md](03-state-machine.md).)
 
-3. **No service produces to Kafka "by hand" where ordering with a DB write matters.** The Temporal worker and the Action Library write to a **Postgres transactional outbox**; Debezium CDC-tails it and publishes to Kafka. This makes "update the DB and emit the event" atomic. (See [09-infrastructure.md](09-infrastructure.md).)
+3. **No service produces to Kafka "by hand" where ordering with a DB write matters.** The Temporal worker, the action API (dispositions/completions) and the Command Center library (definitions/suppress) write to a **Postgres transactional outbox**; Debezium CDC-tails it and publishes to Kafka. This makes "update the DB and emit the event" atomic. (See [09-infrastructure.md](09-infrastructure.md).)
 
 4. **Rules are data, compiled at runtime.** There are **no `.drl` files** in the repo. The rules engine synthesizes Drools DRL from authored JSON condition trees on `nba.definitions` and rebuilds the `KieBase` on change. An operator edit in the Command Center is live within one Kafka round-trip.
 
